@@ -49,6 +49,7 @@ static void usbctl_fill_status(void)
     {
         s_status.eq[b] = RC_EQ_GetBand(b);
     }
+    RC_TakePeaks(s_status.peak);
     (void)strncpy(s_status.filter, RC_FILTER_Describe(), RC_USB_DESC_LEN - 1U);
 }
 
@@ -108,6 +109,16 @@ usb_status_t RC_USBCTL_Handle(usb_device_control_request_struct_t *req)
             else
             {
                 usbctl_apply_set();
+            }
+            return kStatus_USB_Success;
+
+        case RC_REQ_RESET:
+            if (req->isSetup == 1U)
+            {
+                req->buffer = NULL;
+                req->length = 0U;
+                RC_ResetStats();
+                RCS_ResetUnderruns();
             }
             return kStatus_USB_Success;
 

@@ -167,6 +167,11 @@ bool rc_upload_ir(rc_dev *d, const uint8_t *wav, uint32_t len,
     return false;
 }
 
+bool rc_reset_stats(rc_dev *d, const char **err)
+{
+    return ctrl_out(d, RC_REQ_RESET, 0, 0, NULL, 0, err);
+}
+
 const char *rc_ir_result_text(uint8_t code)
 {
     switch (code)

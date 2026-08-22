@@ -38,6 +38,8 @@ bool RCS_PopOutput(void *dst, uint32_t bytes);
 void RCS_Task(void);
 
 uint32_t RCS_Underruns(void);
+/*! Zero the underrun counter. */
+void RCS_ResetUnderruns(void);
 /*! Frames of audio currently sitting in the output FIFO. */
 uint32_t RCS_OutputFill(void);
 /*! One line of load/health statistics on the debug console. */

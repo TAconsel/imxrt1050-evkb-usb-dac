@@ -40,6 +40,9 @@ bool rc_upload_ir(rc_dev *d, const uint8_t *wav, uint32_t len,
                   void (*progress)(uint32_t, uint32_t, void *), void *user,
                   const char **err);
 
+/*! Zero the block, underrun, clip and peak-load counters. */
+bool rc_reset_stats(rc_dev *d, const char **err);
+
 /*! Human-readable form of rc_usb_status_t.irResult. */
 const char *rc_ir_result_text(uint8_t code);
 

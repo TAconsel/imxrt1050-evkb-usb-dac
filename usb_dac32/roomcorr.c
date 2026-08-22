@@ -14,6 +14,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+#include <math.h>
 #include <string.h>
 #include "fsl_debug_console.h"
 #include "fsl_gpt.h"
@@ -92,6 +93,10 @@ static float32_t s_mixBuf[RC_BLOCK]; /* one channel, post-mix, pre-EQ */
 static float32_t s_mix;       /* 1.0 = fully corrected, 0.0 = fully dry */
 static float32_t s_mixTarget;
 static uint32_t s_lastCycles, s_peakCycles, s_clipCount, s_blockCount;
+
+/* peak-hold level per channel, cleared when the host reads it */
+static float32_t s_inPeak[RC_CHANNELS];
+static float32_t s_outPeak[RC_CHANNELS];
 
 static inline float32_t *fdl_slot(uint32_t ch, uint32_t part)
 {
@@ -181,6 +186,12 @@ void RC_ProcessBlock(const int32_t *in, int32_t *out)
         for (uint32_t i = 0U; i < RC_BLOCK; i++)
         {
             const float32_t v = (float32_t)in[(i * RC_CHANNELS) + ch] * RC_INT_TO_FLOAT;
+            const float32_t a = fabsf(v);
+
+            if (a > s_inPeak[ch])
+            {
+                s_inPeak[ch] = a;
+            }
             s_time[RC_BLOCK + i] = v;
             s_prev[ch][i]        = v;
         }
@@ -212,7 +223,13 @@ void RC_ProcessBlock(const int32_t *in, int32_t *out)
 
         for (uint32_t i = 0U; i < RC_BLOCK; i++)
         {
+            const float32_t a = fabsf(s_mixBuf[i]);
             float32_t v = s_mixBuf[i] * RC_FLOAT_TO_INT;
+
+            if (a > s_outPeak[ch])
+            {
+                s_outPeak[ch] = a;
+            }
 
             if (v >= 2147483647.0f)
             {
@@ -246,6 +263,25 @@ uint32_t RC_PeakMicros(void)  { return s_peakCycles / RC_TICKS_PER_US; }
 uint32_t RC_LastMicros(void)  { return s_lastCycles / RC_TICKS_PER_US; }
 /* seed with the last block so the peak is never briefly below the current load */
 void     RC_ResetPeak(void)   { s_peakCycles = s_lastCycles; }
+
+void RC_TakePeaks(float32_t peaks[4])
+{
+    peaks[0] = s_inPeak[0];
+    peaks[1] = s_inPeak[1];
+    peaks[2] = s_outPeak[0];
+    peaks[3] = s_outPeak[1];
+    s_inPeak[0]  = 0.0f;
+    s_inPeak[1]  = 0.0f;
+    s_outPeak[0] = 0.0f;
+    s_outPeak[1] = 0.0f;
+}
+
+void RC_ResetStats(void)
+{
+    s_clipCount  = 0U;
+    s_blockCount = 0U;
+    s_peakCycles = 0U;
+}
 uint32_t RC_PeakCycles(void)  { return s_peakCycles; }
 uint32_t RC_ClipCount(void)   { return s_clipCount; }
 uint32_t RC_BlockCount(void)  { return s_blockCount; }

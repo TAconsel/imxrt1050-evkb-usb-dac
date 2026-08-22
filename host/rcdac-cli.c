@@ -1,6 +1,7 @@
 /* Minimal CLI for the DAC, mostly to prove the transport. SPDX: BSD-3-Clause */
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include "rcdac.h"
 
@@ -13,6 +14,11 @@ static void show(const rc_usb_status_t *s)
     printf("cpu       : %u%% now, %u%% peak   blocks %u   underruns %u   clips %u\n",
            s->cpuPercent, s->cpuPeakPercent, s->blocks, s->underruns, s->clips);
     printf("last upload: %s\n", rc_ir_result_text(s->irResult));
+    printf("levels    : in %+.1f/%+.1f  out %+.1f/%+.1f dBFS peak\n",
+           s->peak[0] > 1e-6 ? 20*log10(s->peak[0]) : -99.0,
+           s->peak[1] > 1e-6 ? 20*log10(s->peak[1]) : -99.0,
+           s->peak[2] > 1e-6 ? 20*log10(s->peak[2]) : -99.0,
+           s->peak[3] > 1e-6 ? 20*log10(s->peak[3]) : -99.0);
     printf("eq        :");
     for (int b = 0; b < s->eqBands; b++)
     {
@@ -76,9 +82,13 @@ int main(int argc, char **argv)
         }
         free(buf);
     }
+    else if (strcmp(argv[1], "reset") == 0)
+    {
+        if (!rc_reset_stats(d, &err)) { fprintf(stderr, "error: %s\n", err); rc = 1; }
+    }
     else
     {
-        fprintf(stderr, "usage: %s [status | bypass 0|1 | preamp <dB> | eq <band> <dB> | ir <file.wav>]\n", argv[0]);
+        fprintf(stderr, "usage: %s [status | bypass 0|1 | preamp <dB> | eq <band> <dB> | ir <file.wav> | reset]\n", argv[0]);
         rc = 2;
     }
     rc_close(d);

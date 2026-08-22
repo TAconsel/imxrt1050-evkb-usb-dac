@@ -22,6 +22,7 @@
 #define RC_REQ_IR_BEGIN  (0x10U) /* OUT, wValue:wIndex = total byte count (hi:lo) */
 #define RC_REQ_IR_DATA   (0x11U) /* OUT, next chunk of the wav */
 #define RC_REQ_IR_COMMIT (0x12U) /* OUT, no data: parse and swap the filter in */
+#define RC_REQ_RESET     (0x03U) /* OUT, no data: zero blocks/underruns/clips/peak */
 
 #define RC_USB_MAGIC     (0x31534352U) /* "RCS1" */
 #define RC_USB_CHUNK     (1024U)       /* bytes per RC_REQ_IR_DATA transfer */
@@ -48,6 +49,12 @@ typedef struct
     uint32_t underruns;
     uint32_t clips;
     uint32_t blocks;
+    /*
+     * Peak magnitude of each channel since the previous status read, linear. Peak-hold
+     * on the device rather than an instantaneous sample, so a transient between polls is
+     * still seen. Order: in L, in R, out L, out R.
+     */
+    float    peak[4];
     char     filter[RC_USB_DESC_LEN];
 } rc_usb_status_t;
 

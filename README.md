@@ -377,6 +377,28 @@ and `IR_BEGIN` / `IR_DATA` / `IR_COMMIT` for uploads. Install
 
     SUBSYSTEM=="usb", ATTR{idVendor}=="1fc9", ATTR{idProduct}=="0098", MODE="0666"
 
+### Level meters and statistics
+Four peak meters -- **in L, in R, out L, out R** -- showing dBFS on a -60..0 scale, plus
+a **Reset statistics** button that zeros the block, underrun, clip and peak-load
+counters.
+
+The device does **peak-hold**, not instantaneous sampling: the host polls every 100 ms
+while blocks are produced every 21 ms, so an instantaneous read would simply miss
+transients. Reading the status takes the held peak and clears it, so nothing is missed
+between polls and nothing is counted twice. Decay ballistics live on the host -- instant
+attack, 36 dB/s fall -- which is what makes a meter readable instead of a flicker.
+
+The out meter doubles as an independent check on the DSP. With a -20 dBFS tone:
+
+| | correction engaged | bypassed |
+|---|---|---|
+| in L/R | -20.0 / -20.0 dBFS | -20.0 / -20.0 |
+| out L/R | **-24.9 / -25.9** | **-20.0 / -20.0** |
+
+The engaged figures match the filter's measured midband attenuation of -5 to -6 dB, and
+bypass passes through at unity. That is the convolution's gain confirmed end to end by a
+path that shares no code with the filter generator.
+
 ### Control panel behaviour
 * **EQ is 16 vertical faders**, mixer-strip style: value on top, fader, centre frequency
   below. GTK vertical ranges run low-at-top by default, so they are inverted to read the

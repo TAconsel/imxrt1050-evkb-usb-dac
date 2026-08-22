@@ -175,6 +175,7 @@ void RCS_Task(void)
 }
 
 uint32_t RCS_Underruns(void) { return s_underruns; }
+void     RCS_ResetUnderruns(void) { s_underruns = 0U; }
 
 uint32_t RCS_OutputFill(void)
 {

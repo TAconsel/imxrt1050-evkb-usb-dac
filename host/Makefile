@@ -9,7 +9,7 @@ rcdac.o: rcdac.c rcdac.h ../usb_dac32/roomcorr_usbctl.h
 	$(CC) $(CFLAGS) $(shell pkg-config --cflags $(LIBUSB)) -c $< -o $@
 
 rcdac-cli: rcdac-cli.c rcdac.o
-	$(CC) $(CFLAGS) $(shell pkg-config --cflags $(LIBUSB)) $^ -o $@ $(shell pkg-config --libs $(LIBUSB))
+	$(CC) $(CFLAGS) $(shell pkg-config --cflags $(LIBUSB)) $^ -o $@ $(shell pkg-config --libs $(LIBUSB)) -lm
 
 rcdac-gtk: rcdac-gtk.c rcdac.o
 	$(CC) $(CFLAGS) $(shell pkg-config --cflags $(PKGS_GTK) $(LIBUSB)) $^ -o $@ \

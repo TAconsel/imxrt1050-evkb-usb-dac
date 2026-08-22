@@ -50,6 +50,20 @@ uint32_t RC_ClipCount(void);
 /*! Blocks processed since boot. */
 uint32_t RC_BlockCount(void);
 
+/*!
+ * @brief Take the peak level of each channel since the previous call, and clear it.
+ *
+ * Peak-hold rather than instantaneous: the host polls far more slowly than blocks are
+ * produced, and reading an instantaneous value would simply miss transients. Reading
+ * clears the hold, so nothing is counted twice and nothing is lost between polls.
+ *
+ * @param peaks  four linear magnitudes, 0..1+: in L, in R, out L, out R
+ */
+void RC_TakePeaks(float32_t peaks[4]);
+
+/*! Zero the block, clip and peak-load counters. */
+void RC_ResetStats(void);
+
 /*! When bypassed the block is copied through untouched. */
 void RC_SetBypass(bool bypass);
 bool RC_GetBypass(void);

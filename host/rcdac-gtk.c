@@ -9,6 +9,7 @@
 
 #include <gtk/gtk.h>
 #include <stdio.h>
+#include <math.h>
 #include <string.h>
 #include "rcdac.h"
 
@@ -31,6 +32,9 @@ typedef struct
     GtkWidget   *irLabel;
     GtkWidget   *progress;
     GtkWidget   *banner;
+    GtkWidget   *meter[4];      /* in L, in R, out L, out R */
+    GtkWidget   *meterVal[4];
+    double       meterDb[4];    /* displayed level, with decay applied */
     gboolean     syncing;   /* suppress change handlers while pushing device state in */
     /*
      * When a slider was last moved by the user, index 16 being the preamp. At a 200 ms
@@ -46,6 +50,55 @@ typedef struct
 static gboolean recently_touched(App *a, int idx)
 {
     return (g_get_monotonic_time() - a->touched[idx]) < RC_TOUCH_GRACE_US;
+}
+
+#define RC_METER_FLOOR_DB (-60.0)
+#define RC_METER_DECAY_DB (36.0) /* dB per second the bar falls once the peak passes */
+
+static const char *const kMeterName[4] = {"in L", "in R", "out L", "out R"};
+
+static double lin_to_db(double v)
+{
+    return (v > 1e-6) ? (20.0 * log10(v)) : RC_METER_FLOOR_DB;
+}
+
+/*
+ * Peak-hold on the device, decay here. Instant attack so a transient is never smoothed
+ * away, then a steady fall, which is what makes a meter readable rather than a flicker.
+ */
+static void meter_update(App *a, int i, double peakLin, double dtSec)
+{
+    double db = lin_to_db(peakLin);
+    char   buf[24];
+
+    if (db > a->meterDb[i])
+    {
+        a->meterDb[i] = db; /* attack */
+    }
+    else
+    {
+        a->meterDb[i] -= RC_METER_DECAY_DB * dtSec;
+        if (a->meterDb[i] < db)
+        {
+            a->meterDb[i] = db;
+        }
+    }
+    if (a->meterDb[i] < RC_METER_FLOOR_DB)
+    {
+        a->meterDb[i] = RC_METER_FLOOR_DB;
+    }
+
+    gtk_level_bar_set_value(GTK_LEVEL_BAR(a->meter[i]),
+                            (a->meterDb[i] - RC_METER_FLOOR_DB) / (0.0 - RC_METER_FLOOR_DB));
+    if (a->meterDb[i] <= RC_METER_FLOOR_DB)
+    {
+        snprintf(buf, sizeof(buf), "  -inf");
+    }
+    else
+    {
+        snprintf(buf, sizeof(buf), "%+6.1f", a->meterDb[i]);
+    }
+    gtk_label_set_text(GTK_LABEL(a->meterVal[i]), buf);
 }
 
 /* Label the slider owns, so a handler can refresh it without waiting for the poll. */
@@ -149,6 +202,11 @@ static gboolean refresh(gpointer user)
         }
     }
 
+    for (int i = 0; i < 4; i++)
+    {
+        meter_update(a, i, (double)s.peak[i], 0.1); /* the poll period, see g_timeout_add */
+    }
+
     snprintf(buf, sizeof(buf),
              "filter      %s\n"
              "taps        %u @ %u Hz source\n"
@@ -227,6 +285,19 @@ static void on_flatten(GtkButton *btn, gpointer user)
             break;
         }
     }
+}
+
+static void on_reset_stats(GtkButton *btn, gpointer user)
+{
+    App *a = user;
+    const char *err = NULL;
+    (void)btn;
+
+    if (a->dev != NULL && !rc_reset_stats(a->dev, &err))
+    {
+        set_banner(a, err, TRUE);
+    }
+    refresh(a);
 }
 
 static void upload_progress(uint32_t done, uint32_t total, void *user)
@@ -368,7 +439,7 @@ static void activate(GtkApplication *app, gpointer user)
 
     a->window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(a->window), "RT1050 Room Correction");
-    gtk_window_set_default_size(GTK_WINDOW(a->window), 860, 700);
+    gtk_window_set_default_size(GTK_WINDOW(a->window), 860, 860);
 
     box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_widget_set_margin_top(box, 14);
@@ -384,6 +455,37 @@ static void activate(GtkApplication *app, gpointer user)
     a->bypassBtn = gtk_button_new_with_label("Correction ENGAGED");
     g_signal_connect(a->bypassBtn, "clicked", G_CALLBACK(on_bypass), a);
     gtk_box_append(GTK_BOX(box), a->bypassBtn);
+
+    sect = gtk_label_new("Levels");
+    gtk_label_set_xalign(GTK_LABEL(sect), 0.0f);
+    gtk_widget_add_css_class(sect, "heading");
+    gtk_box_append(GTK_BOX(box), sect);
+
+    GtkWidget *meters = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
+    for (int i = 0; i < 4; i++)
+    {
+        a->meter[i] = gtk_level_bar_new();
+        gtk_level_bar_set_mode(GTK_LEVEL_BAR(a->meter[i]), GTK_LEVEL_BAR_MODE_CONTINUOUS);
+        gtk_level_bar_set_min_value(GTK_LEVEL_BAR(a->meter[i]), 0.0);
+        gtk_level_bar_set_max_value(GTK_LEVEL_BAR(a->meter[i]), 1.0);
+        /* -6 dBFS and -1 dBFS on a -60..0 scale, so the bar turns as it gets hot */
+        gtk_level_bar_add_offset_value(GTK_LEVEL_BAR(a->meter[i]), GTK_LEVEL_BAR_OFFSET_LOW, 0.90);
+        gtk_level_bar_add_offset_value(GTK_LEVEL_BAR(a->meter[i]), GTK_LEVEL_BAR_OFFSET_HIGH, 0.983);
+        gtk_level_bar_add_offset_value(GTK_LEVEL_BAR(a->meter[i]), GTK_LEVEL_BAR_OFFSET_FULL, 1.0);
+        gtk_widget_set_size_request(a->meter[i], -1, 14);
+
+        a->meterVal[i] = gtk_label_new("  -inf");
+        gtk_widget_add_css_class(a->meterVal[i], "monospace");
+        a->meterDb[i] = RC_METER_FLOOR_DB;
+        gtk_box_append(GTK_BOX(meters),
+                       labelled_row(kMeterName[i], a->meter[i], a->meterVal[i], 64));
+    }
+    gtk_box_append(GTK_BOX(box), meters);
+
+    GtkWidget *scaleHint = gtk_label_new("peak dBFS, -60 to 0");
+    gtk_label_set_xalign(GTK_LABEL(scaleHint), 0.0f);
+    gtk_widget_add_css_class(scaleHint, "dim-label");
+    gtk_box_append(GTK_BOX(box), scaleHint);
 
     sect = gtk_label_new("Preamp");
     gtk_label_set_xalign(GTK_LABEL(sect), 0.0f);
@@ -449,6 +551,11 @@ static void activate(GtkApplication *app, gpointer user)
     gtk_widget_add_css_class(sect, "heading");
     gtk_box_append(GTK_BOX(box), sect);
 
+    GtkWidget *resetBtn = gtk_button_new_with_label("Reset statistics");
+    gtk_widget_set_tooltip_text(resetBtn, "zero the block, underrun, clip and peak-load counters");
+    g_signal_connect(resetBtn, "clicked", G_CALLBACK(on_reset_stats), a);
+    gtk_box_append(GTK_BOX(box), resetBtn);
+
     a->stats = gtk_label_new("");
     gtk_label_set_xalign(GTK_LABEL(a->stats), 0.0f);
     gtk_label_set_selectable(GTK_LABEL(a->stats), TRUE);
@@ -459,7 +566,7 @@ static void activate(GtkApplication *app, gpointer user)
     gtk_window_present(GTK_WINDOW(a->window));
 
     refresh(a);
-    g_timeout_add(200, refresh, a); /* a status read is ~1 ms, so this is cheap */
+    g_timeout_add(100, refresh, a); /* ~1 ms per read; fast enough for the meters */
 }
 
 int main(int argc, char **argv)
