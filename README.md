@@ -256,3 +256,47 @@ CPU scales with the partition count, memory with `2 * taps`. At 24% for 341 ms t
 room for roughly a 1 second IR before the block budget gets tight, and SDRAM (32 MB
 against 320 KiB used) is nowhere near a limit. Nothing in the firmware is hard-coded to
 this filter -- `make_filter.py` regenerates `roomcorr_params.h` and the geometry follows.
+
+### SW8 toggles the correction, D18 shows it
+
+The board has exactly one free user button and one user LED, and the SDK board header
+already names both:
+
+| | net | pin | polarity |
+|---|---|---|---|
+| **SW8** `USER_BUTTON` | `WAKEUP` | GPIO5_IO00 (SNVS, pin L6) | active low, external pull-up |
+| **D18** `USER_LED` | `USER_LED` | GPIO_AD_B0_09 -> GPIO1_IO09 | active low |
+
+Press SW8 to toggle. **D18 lit = correction engaged; dark = bypassed.** The console
+echoes `room correction BYPASSED` / `engaged`.
+
+Neither pin is touched by the audio example's `pin_mux.c`, so `roomcorr_ui.c` muxes them
+itself rather than editing the generated file. The button is polled from the main loop
+with a debounce counter, not interrupt driven -- the loop already turns over every few
+milliseconds, which is the right timescale for a button, and it keeps another interrupt
+out of the audio path. GPIO_AD_B0_09 doubles as JTAG_TDI, so driving the LED disturbs a
+live debug session; that is the board, not the firmware.
+
+**Bypass is a crossfade, and the convolution never stops.** Two reasons: the delay line
+has to keep being fed or switching back would play out of a stale FDL, and having the
+wet signal always available is what allows a click-free transition. `s_mix` ramps over
+one block (21 ms). CPU is therefore the same ~24% in both modes. The two signals are not
+phase aligned during the ramp -- the filter carries ~46 ms of its own pre-delay -- so the
+crossfade is not coherent, but over one block it reads as a smooth transition rather than
+the hard click a bare switch gives.
+
+**Expect bypass to sound louder.** This filter is net attenuation: about -5 to -6 dB
+through the midband and up to -20 dB at 40-80 Hz. Bypass is a true bypass, not level
+matched, so A/B will favour it on loudness alone. Match levels with the volume control
+before judging.
+
+Verified by driving GPIO5_IO00 from the debug probe (`GPIO_PinRead()` reads `DR`, so
+setting `GDIR` and clearing `DR` exercises exactly the path the switch does), then
+handing the pin back:
+
+    at boot        : LED ON (corrected)
+    after press 1  : LED off (bypassed)     console: room correction BYPASSED
+    after press 2  : LED ON (corrected)     console: room correction engaged
+
+Still 24-25% CPU, 0 clips, and no new underruns in either mode. Confirm the physical
+press yourself -- I could only drive the pin, not push the switch.

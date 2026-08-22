@@ -73,6 +73,8 @@ mcux_add_source(
     "roomcorr_params.h"
     "roomcorr_stream.c"
     "roomcorr_stream.h"
+    "roomcorr_ui.c"
+    "roomcorr_ui.h"
     "audio_speaker.c"
     "audio_speaker.h"
     "usb_device_descriptor.c"

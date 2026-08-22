@@ -28,6 +28,7 @@
 #include "fsl_codec_adapter.h"
 #include "roomcorr.h"
 #include "roomcorr_stream.h"
+#include "roomcorr_ui.h"
 /*${header:end}*/
 /*${variable:start}*/
 extern usb_audio_speaker_struct_t g_UsbDeviceAudioSpeaker;
@@ -142,6 +143,7 @@ void BOARD_InitHardware(void)
     /* SDRAM is up (boot-header DCD) and BOARD_ConfigMPU() has already marked
      * 0x80000000 Normal cacheable, because SKIP_SYSCLK_INIT is defined. */
     RCS_Init();
+    RC_UI_Init();
 }
 
 /*

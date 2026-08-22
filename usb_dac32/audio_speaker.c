@@ -32,6 +32,7 @@
 #include "usb_phy.h"
 #include "roomcorr.h"
 #include "roomcorr_stream.h"
+#include "roomcorr_ui.h"
 #endif
 #if defined(USB_DEVICE_AUDIO_USE_SYNC_MODE) && (USB_DEVICE_AUDIO_USE_SYNC_MODE > 0U)
 #include "fsl_ctimer.h"
@@ -1846,6 +1847,8 @@ void main(void)
          * an underrun there is audible, whereas the USB and codec housekeeping below
          * can tolerate a few ms of jitter. */
         RCS_Task();
+
+        RC_UI_Task();
 
         USB_AudioCodecTask();
 

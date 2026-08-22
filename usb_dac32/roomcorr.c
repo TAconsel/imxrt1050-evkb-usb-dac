@@ -73,7 +73,19 @@ static float32_t s_time[RC_FFT_SIZE];
 static float32_t s_freq[RC_FFT_SIZE];
 static float32_t s_acc[RC_FFT_SIZE];
 
-static bool s_bypass;
+/*
+ * Wet/dry mix. The convolution runs unconditionally, even when bypassed: the delay line
+ * has to keep being fed or switching back would play out of a stale FDL, and having the
+ * wet signal always available is what makes a click-free crossfade possible. It costs
+ * the same ~24% CPU either way, which is affordable.
+ *
+ * s_mix ramps to s_mixTarget across one block (21 ms). The two signals are not time
+ * aligned during the ramp -- the filter has ~46 ms of its own pre-delay -- so the
+ * crossfade is not phase coherent, but over one block it just sounds like a smooth
+ * transition rather than the hard click a bare switch would give.
+ */
+static float32_t s_mix;       /* 1.0 = fully corrected, 0.0 = fully dry */
+static float32_t s_mixTarget;
 static uint32_t s_lastCycles, s_peakCycles, s_clipCount, s_blockCount;
 
 static inline float32_t *fdl_slot(uint32_t ch, uint32_t part)
@@ -119,7 +131,8 @@ void RC_Init(void)
     memset(s_fdl, 0, RC_FDL_FLOATS * sizeof(float32_t));
     memset(s_prev, 0, sizeof(s_prev));
     s_head       = 0U;
-    s_bypass     = false;
+    s_mix        = 1.0f;
+    s_mixTarget  = 1.0f;
     s_lastCycles = 0U;
     s_peakCycles = 0U;
     s_clipCount  = 0U;
@@ -133,15 +146,9 @@ void RC_Init(void)
 
 void RC_ProcessBlock(const int32_t *in, int32_t *out)
 {
-    const uint32_t t0 = rc_now();
-
-    if (s_bypass)
-    {
-        memcpy(out, in, RC_BLOCK * RC_CHANNELS * sizeof(int32_t));
-        s_lastCycles = rc_elapsed(t0);
-        s_blockCount++;
-        return;
-    }
+    const uint32_t t0     = rc_now();
+    const float32_t gStart = s_mix;
+    const float32_t gStep  = (s_mixTarget - s_mix) / (float32_t)RC_BLOCK;
 
     /* one step back: slot s_head holds the newest spectrum */
     s_head = (s_head + RC_PARTITIONS - 1U) % RC_PARTITIONS;
@@ -169,16 +176,21 @@ void RC_ProcessBlock(const int32_t *in, int32_t *out)
         arm_rfft_fast_f32(&s_fft, s_acc, s_freq, 1);
 
         /* keep the second half; the first half is the wrapped part */
+        float32_t g = gStart;
         for (uint32_t i = 0U; i < RC_BLOCK; i++)
         {
-            float32_t v = s_freq[RC_BLOCK + i] * RC_IFFT_COMPENSATION * RC_FLOAT_TO_INT;
+            const float32_t wet = s_freq[RC_BLOCK + i] * RC_IFFT_COMPENSATION;
+            const float32_t dry = (float32_t)in[(i * RC_CHANNELS) + ch] * RC_INT_TO_FLOAT;
+            float32_t v = ((wet * g) + (dry * (1.0f - g))) * RC_FLOAT_TO_INT;
+
+            g += gStep;
 
             if (v >= 2147483647.0f)
             {
                 v = 2147483647.0f;
                 s_clipCount++;
             }
-            else if (v <= -2147483648.0f)
+            else if (v < -2147483648.0f) /* exact negative full scale is not a clip */
             {
                 v = -2147483648.0f;
                 s_clipCount++;
@@ -190,6 +202,7 @@ void RC_ProcessBlock(const int32_t *in, int32_t *out)
             out[(i * RC_CHANNELS) + ch] = (int32_t)v;
         }
     }
+    s_mix = s_mixTarget;
 
     s_lastCycles = rc_elapsed(t0);
     if (s_lastCycles > s_peakCycles)
@@ -204,8 +217,8 @@ uint32_t RC_PeakCycles(void)  { return s_peakCycles; }
 uint32_t RC_ClipCount(void)   { return s_clipCount; }
 uint32_t RC_BlockCount(void)  { return s_blockCount; }
 
-void RC_SetBypass(bool bypass) { s_bypass = bypass; }
-bool RC_GetBypass(void)        { return s_bypass; }
+void RC_SetBypass(bool bypass) { s_mixTarget = bypass ? 0.0f : 1.0f; }
+bool RC_GetBypass(void)        { return (s_mixTarget < 0.5f); }
 
 void RC_SelfTest(void)
 {
