@@ -1,0 +1,14 @@
+# west workspace (1.8 GB, its own git repos) - recreate with:
+#   west init -m https://github.com/nxp-mcuxpresso/mcuxsdk-manifests --mr v26.06.00-LTS mcuxsdk
+mcuxsdk/
+
+# python venv holding west + pyocd
+.venv/
+
+# build outputs
+build/
+*/build/
+
+# NXP board design files (schematic/gerber/layout/BOM, ~15 MB).
+# Not redistributed here - download RT1050EVKB-DESIGNFILES from nxp.com.
+RT1050EVKB-DESIGNFILES/
