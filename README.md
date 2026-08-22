@@ -378,15 +378,26 @@ and `IR_BEGIN` / `IR_DATA` / `IR_COMMIT` for uploads. Install
     SUBSYSTEM=="usb", ATTR{idVendor}=="1fc9", ATTR{idProduct}=="0098", MODE="0666"
 
 ### Level meters and statistics
-Four peak meters -- **in L, in R, out L, out R** -- showing dBFS on a -60..0 scale, plus
-a **Reset statistics** button that zeros the block, underrun, clip and peak-load
-counters.
+Four **vertical** peak meters -- in L, in R, out L, out R -- to the right of the faders,
+plus a **Reset statistics** button that zeros the block, underrun, clip and peak-load
+counters (and drops the peak markers).
 
-The device does **peak-hold**, not instantaneous sampling: the host polls every 100 ms
-while blocks are produced every 21 ms, so an instantaneous read would simply miss
-transients. Reading the status takes the held peak and clears it, so nothing is missed
-between polls and nothing is counted twice. Decay ballistics live on the host -- instant
-attack, 36 dB/s fall -- which is what makes a meter readable instead of a flicker.
+Custom-drawn rather than `GtkLevelBar`, because two things had to be shown at once:
+
+* a **fast bar**, instant attack and 48 dB/s decay, coloured green below -6 dBFS, amber
+  to -1, red above, so a hot signal is obvious without reading the number;
+* a **slow-decay peak marker** -- a thin line that jumps to each new peak, sits for
+  1.2 s, then falls at 11 dB/s. The numeric readout tracks the marker, since that is the
+  figure actually worth reading.
+
+The device does the **peak-hold**, not the host. Blocks are produced every 21.3 ms and
+the poll runs at 40 ms, so every read covers at least one whole block and no transient
+is ever missed; reading takes the held peak and clears it. Decay is a display concern and
+stays on the host.
+
+Polling at 25 Hz costs about 1 ms per read and measured 0 underruns and 0 clips on the
+device. The status text block is only relaid every 10th tick, since it does not need
+25 Hz and relayout is the expensive part.
 
 The out meter doubles as an independent check on the DSP. With a -20 dBFS tone:
 
@@ -397,12 +408,14 @@ The out meter doubles as an independent check on the DSP. With a -20 dBFS tone:
 
 The engaged figures match the filter's measured midband attenuation of -5 to -6 dB, and
 bypass passes through at unity. That is the convolution's gain confirmed end to end by a
-path that shares no code with the filter generator.
+path that shares no code with the filter generator. On real music the gap widens to
+15 dB or more on bass-heavy passages, which is the -19 dB the filter takes out at
+40-80 Hz doing its job.
 
 ### Control panel behaviour
-* **EQ is 16 vertical faders**, mixer-strip style: value on top, fader, centre frequency
-  below. GTK vertical ranges run low-at-top by default, so they are inverted to read the
-  way a graphic EQ should.
+* Laid out as a mixer strip: **preamp fader, then the 16 EQ faders, then the meters**,
+  all vertical and sharing one `fader_column()` builder. GTK vertical ranges run
+  low-at-top by default, so they are inverted to read the way a fader should.
 * **Double-click any fader (or the preamp) to reset it to 0 dB.** The gesture is attached
   in the *capture* phase on purpose: `GtkScale` has its own click and drag gestures, and
   in the bubble phase they claim the sequence first so the second press never arrives.

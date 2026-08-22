@@ -4,12 +4,14 @@
  * Talks to the board over vendor control transfers on the audio device's endpoint 0
  * (see rcdac.h), so no extra cable and playback is never interrupted.
  *
+ * Laid out like a mixer: preamp fader, sixteen EQ faders, then the four meters.
+ *
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
 #include <gtk/gtk.h>
-#include <stdio.h>
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include "rcdac.h"
 
@@ -18,104 +20,153 @@ static const char *const kBandLabel[16] = {
     "20",   "31",   "50",   "80",   "125",  "200",  "315",   "500",
     "800",  "1.25k","2k",   "3.15k","5k",   "8k",   "12.5k", "20k",
 };
+static const char *const kMeterName[4] = {"in L", "in R", "out L", "out R"};
+
+#define RC_POLL_MS       (40)      /* 25 Hz; a status read is about 1 ms */
+#define RC_STATS_EVERY   (10)      /* refresh the text block every 10th tick */
+
+#define RC_FLOOR_DB      (-60.0)
+#define RC_FAST_DECAY_DB (48.0)    /* dB/s the bar falls */
+#define RC_HOLD_DECAY_DB (11.0)    /* dB/s the peak marker falls, once it starts */
+#define RC_HOLD_TIME_US  (1200000) /* how long the marker sits before decaying */
+#define RC_TOUCH_GRACE_US (700000)
 
 typedef struct
 {
-    rc_dev      *dev;
-    GtkWidget   *window;
-    GtkWidget   *bypassBtn;
-    GtkWidget   *preamp;
-    GtkWidget   *preampVal;
-    GtkWidget   *eq[16];
-    GtkWidget   *eqVal[16];
-    GtkWidget   *stats;
-    GtkWidget   *irLabel;
-    GtkWidget   *progress;
-    GtkWidget   *banner;
-    GtkWidget   *meter[4];      /* in L, in R, out L, out R */
-    GtkWidget   *meterVal[4];
-    double       meterDb[4];    /* displayed level, with decay applied */
-    gboolean     syncing;   /* suppress change handlers while pushing device state in */
-    /*
-     * When a slider was last moved by the user, index 16 being the preamp. At a 200 ms
-     * poll, relying on keyboard focus alone to decide "don't overwrite this one" is too
-     * fragile -- a touchpad drag may not focus the widget -- so a short grace period
-     * after any user movement keeps the poll from snapping the slider back mid-gesture.
-     */
-    gint64       touched[17];
-} App;
+    GtkWidget *area;
+    GtkWidget *val;
+    double     fastDb;   /* the bar */
+    double     holdDb;   /* the slow peak marker */
+    gint64     holdUntil;
+} Meter;
 
-#define RC_TOUCH_GRACE_US (700000) /* 0.7 s */
+typedef struct
+{
+    rc_dev    *dev;
+    GtkWidget *window;
+    GtkWidget *bypassBtn;
+    GtkWidget *preamp;
+    GtkWidget *preampVal;
+    GtkWidget *eq[16];
+    GtkWidget *eqVal[16];
+    Meter      meter[4];
+    GtkWidget *stats;
+    GtkWidget *irLabel;
+    GtkWidget *progress;
+    GtkWidget *banner;
+    gboolean   syncing;
+    gint64     touched[17];  /* 0..15 EQ, 16 preamp */
+    int        tick;
+} App;
 
 static gboolean recently_touched(App *a, int idx)
 {
     return (g_get_monotonic_time() - a->touched[idx]) < RC_TOUCH_GRACE_US;
 }
 
-#define RC_METER_FLOOR_DB (-60.0)
-#define RC_METER_DECAY_DB (36.0) /* dB per second the bar falls once the peak passes */
+/* ----------------------------------------------------------------- meter ---- */
 
-static const char *const kMeterName[4] = {"in L", "in R", "out L", "out R"};
-
-static double lin_to_db(double v)
+static double db_to_frac(double db)
 {
-    return (v > 1e-6) ? (20.0 * log10(v)) : RC_METER_FLOOR_DB;
+    double f = (db - RC_FLOOR_DB) / (0.0 - RC_FLOOR_DB);
+    return (f < 0.0) ? 0.0 : ((f > 1.0) ? 1.0 : f);
 }
 
 /*
- * Peak-hold on the device, decay here. Instant attack so a transient is never smoothed
- * away, then a steady fall, which is what makes a meter readable rather than a flicker.
+ * Vertical bar drawn bottom-up, coloured in three zones so a hot signal is obvious
+ * without reading the number, plus a thin marker showing the slowly decaying peak.
  */
-static void meter_update(App *a, int i, double peakLin, double dtSec)
+static void meter_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h, gpointer user)
 {
-    double db = lin_to_db(peakLin);
-    char   buf[24];
+    const Meter *m = user;
+    (void)area;
 
-    if (db > a->meterDb[i])
+    cairo_set_source_rgb(cr, 0.11, 0.12, 0.14);
+    cairo_rectangle(cr, 0, 0, w, h);
+    cairo_fill(cr);
+
+    const double zones[3]  = {-6.0, -1.0, 0.0};
+    const double rgb[3][3] = {{0.18, 0.76, 0.36}, {0.90, 0.72, 0.20}, {0.88, 0.25, 0.25}};
+    double from = RC_FLOOR_DB;
+
+    for (int z = 0; z < 3; z++)
     {
-        a->meterDb[i] = db; /* attack */
-    }
-    else
-    {
-        a->meterDb[i] -= RC_METER_DECAY_DB * dtSec;
-        if (a->meterDb[i] < db)
+        double to = (m->fastDb < zones[z]) ? m->fastDb : zones[z];
+        if (to > from)
         {
-            a->meterDb[i] = db;
+            double y0 = h * (1.0 - db_to_frac(to));
+            double y1 = h * (1.0 - db_to_frac(from));
+            cairo_set_source_rgb(cr, rgb[z][0], rgb[z][1], rgb[z][2]);
+            cairo_rectangle(cr, 1, y0, w - 2, y1 - y0);
+            cairo_fill(cr);
         }
-    }
-    if (a->meterDb[i] < RC_METER_FLOOR_DB)
-    {
-        a->meterDb[i] = RC_METER_FLOOR_DB;
+        from = zones[z];
     }
 
-    gtk_level_bar_set_value(GTK_LEVEL_BAR(a->meter[i]),
-                            (a->meterDb[i] - RC_METER_FLOOR_DB) / (0.0 - RC_METER_FLOOR_DB));
-    if (a->meterDb[i] <= RC_METER_FLOOR_DB)
+    if (m->holdDb > RC_FLOOR_DB)
     {
-        snprintf(buf, sizeof(buf), "  -inf");
+        double y = h * (1.0 - db_to_frac(m->holdDb));
+        cairo_set_source_rgb(cr, 0.95, 0.95, 0.97);
+        cairo_rectangle(cr, 0, (y < 1.0) ? 0.0 : (y - 1.0), w, 2);
+        cairo_fill(cr);
     }
-    else
-    {
-        snprintf(buf, sizeof(buf), "%+6.1f", a->meterDb[i]);
-    }
-    gtk_label_set_text(GTK_LABEL(a->meterVal[i]), buf);
+
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.25); /* 0 dBFS tick */
+    cairo_rectangle(cr, 0, 0, w, 1);
+    cairo_fill(cr);
 }
 
-/* Label the slider owns, so a handler can refresh it without waiting for the poll. */
-static void show_value(GtkRange *r, const char *suffix)
+static void meter_update(Meter *m, double peakLin, double dtSec)
+{
+    const double db  = (peakLin > 1e-6) ? (20.0 * log10(peakLin)) : RC_FLOOR_DB;
+    const gint64 now = g_get_monotonic_time();
+    char buf[24];
+
+    if (db > m->fastDb)
+    {
+        m->fastDb = db; /* instant attack */
+    }
+    else
+    {
+        m->fastDb -= RC_FAST_DECAY_DB * dtSec;
+        if (m->fastDb < db) { m->fastDb = db; }
+    }
+    if (m->fastDb < RC_FLOOR_DB) { m->fastDb = RC_FLOOR_DB; }
+
+    if (db >= m->holdDb)
+    {
+        m->holdDb    = db;
+        m->holdUntil = now + RC_HOLD_TIME_US;
+    }
+    else if (now > m->holdUntil)
+    {
+        m->holdDb -= RC_HOLD_DECAY_DB * dtSec;
+        if (m->holdDb < m->fastDb) { m->holdDb = m->fastDb; }
+    }
+    if (m->holdDb < RC_FLOOR_DB) { m->holdDb = RC_FLOOR_DB; }
+
+    /* the number tracks the marker, which is the figure worth reading off */
+    if (m->holdDb <= RC_FLOOR_DB) { snprintf(buf, sizeof(buf), "-inf"); }
+    else                          { snprintf(buf, sizeof(buf), "%.1f", m->holdDb); }
+    gtk_label_set_text(GTK_LABEL(m->val), buf);
+    gtk_widget_queue_draw(m->area);
+}
+
+/* ---------------------------------------------------------------- widgets ---- */
+
+static void show_value(GtkRange *r)
 {
     GtkWidget *lbl = g_object_get_data(G_OBJECT(r), "valuelabel");
     char buf[32];
 
     if (lbl != NULL)
     {
-        snprintf(buf, sizeof(buf), "%+.1f%s", gtk_range_get_value(r), suffix);
+        snprintf(buf, sizeof(buf), "%+.1f", gtk_range_get_value(r));
         gtk_label_set_text(GTK_LABEL(lbl), buf);
     }
 }
 
-static void on_double_click(GtkGestureClick *g, gint n_press, gdouble x, gdouble y,
-                            gpointer user)
+static void on_double_click(GtkGestureClick *g, gint n_press, gdouble x, gdouble y, gpointer user)
 {
     (void)x;
     (void)y;
@@ -126,16 +177,14 @@ static void on_double_click(GtkGestureClick *g, gint n_press, gdouble x, gdouble
     }
 }
 
-/*! Double-clicking anywhere on a slider snaps it back to 0 dB. */
 static void add_double_click_reset(GtkWidget *scale)
 {
     GtkGesture *g = gtk_gesture_click_new();
 
     gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(g), GDK_BUTTON_PRIMARY);
     /*
-     * Capture phase on purpose. GtkScale has its own click and drag gestures; in the
-     * bubble phase they claim the sequence first and the second press never reaches us.
-     * Capturing lets single clicks fall through untouched and only intercepts the pair.
+     * Capture phase on purpose: GtkScale's own click and drag gestures claim the
+     * sequence in the bubble phase, so the second press would never reach us.
      */
     gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(g), GTK_PHASE_CAPTURE);
     g_signal_connect(g, "pressed", G_CALLBACK(on_double_click), scale);
@@ -148,6 +197,64 @@ static void set_banner(App *a, const char *msg, gboolean bad)
     gtk_widget_remove_css_class(a->banner, "error");
     gtk_widget_remove_css_class(a->banner, "dim-label");
     gtk_widget_add_css_class(a->banner, bad ? "error" : "dim-label");
+}
+
+/*
+ * One fader as a strip: value on top, vertical scale, name below. GTK vertical ranges
+ * run low-at-top by default, so they need inverting to read like a fader.
+ */
+static GtkWidget *fader_column(GtkWidget **scaleOut, GtkWidget **valOut, const char *name,
+                               double lo, double hi, int width, gboolean bold)
+{
+    GtkWidget *col   = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    GtkWidget *val   = gtk_label_new("+0.0");
+    GtkWidget *lbl   = gtk_label_new(name);
+    GtkWidget *scale = gtk_scale_new_with_range(GTK_ORIENTATION_VERTICAL, lo, hi, 0.5);
+
+    gtk_range_set_inverted(GTK_RANGE(scale), TRUE);
+    gtk_scale_set_draw_value(GTK_SCALE(scale), FALSE);
+    gtk_scale_add_mark(GTK_SCALE(scale), 0.0, GTK_POS_LEFT, NULL);
+    gtk_widget_set_vexpand(scale, TRUE);
+    gtk_widget_set_size_request(scale, width, 200);
+    gtk_widget_set_tooltip_text(scale, "drag to adjust, double-click to reset to 0 dB");
+    g_object_set_data(G_OBJECT(scale), "valuelabel", val);
+    add_double_click_reset(scale);
+
+    gtk_widget_add_css_class(val, "monospace");
+    gtk_widget_add_css_class(lbl, bold ? "heading" : "dim-label");
+    gtk_box_append(GTK_BOX(col), val);
+    gtk_box_append(GTK_BOX(col), scale);
+    gtk_box_append(GTK_BOX(col), lbl);
+
+    *scaleOut = scale;
+    *valOut   = val;
+    return col;
+}
+
+static GtkWidget *meter_column(App *a, int i)
+{
+    GtkWidget *col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    Meter     *m   = &a->meter[i];
+
+    m->val    = gtk_label_new("-inf");
+    m->area   = gtk_drawing_area_new();
+    m->fastDb = RC_FLOOR_DB;
+    m->holdDb = RC_FLOOR_DB;
+
+    gtk_widget_set_size_request(m->area, 20, 200);
+    gtk_widget_set_vexpand(m->area, TRUE);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(m->area), meter_draw, m, NULL);
+    gtk_widget_set_tooltip_text(m->area,
+                                "peak dBFS, -60 at the bottom.\n"
+                                "bar falls fast, the line is a slow-decay peak hold");
+
+    GtkWidget *lbl = gtk_label_new(kMeterName[i]);
+    gtk_widget_add_css_class(m->val, "monospace");
+    gtk_widget_add_css_class(lbl, "dim-label");
+    gtk_box_append(GTK_BOX(col), m->val);
+    gtk_box_append(GTK_BOX(col), m->area);
+    gtk_box_append(GTK_BOX(col), lbl);
+    return col;
 }
 
 /* ------------------------------------------------------------------ poll ---- */
@@ -174,8 +281,13 @@ static gboolean refresh(gpointer user)
     {
         set_banner(a, err, TRUE);
         rc_close(a->dev);
-        a->dev = NULL; /* re-open on the next tick, so unplugging is not fatal */
+        a->dev = NULL; /* re-open next tick, so unplugging is not fatal */
         return G_SOURCE_CONTINUE;
+    }
+
+    for (int i = 0; i < 4; i++)
+    {
+        meter_update(&a->meter[i], (double)s.peak[i], RC_POLL_MS / 1000.0);
     }
 
     a->syncing = TRUE;
@@ -188,10 +300,9 @@ static gboolean refresh(gpointer user)
     if (!recently_touched(a, 16))
     {
         gtk_range_set_value(GTK_RANGE(a->preamp), s.preamp);
-        snprintf(buf, sizeof(buf), "%+.1f dB", (double)s.preamp);
+        snprintf(buf, sizeof(buf), "%+.1f", (double)s.preamp);
         gtk_label_set_text(GTK_LABEL(a->preampVal), buf);
     }
-
     for (int b = 0; b < 16 && b < s.eqBands; b++)
     {
         if (!recently_touched(a, b))
@@ -202,20 +313,19 @@ static gboolean refresh(gpointer user)
         }
     }
 
-    for (int i = 0; i < 4; i++)
+    /* the text block does not need 25 Hz, and relaying it out that often is wasteful */
+    if ((a->tick++ % RC_STATS_EVERY) == 0)
     {
-        meter_update(a, i, (double)s.peak[i], 0.1); /* the poll period, see g_timeout_add */
+        snprintf(buf, sizeof(buf),
+                 "filter      %s\n"
+                 "taps        %u @ %u Hz source\n"
+                 "dsp load    %u %% now, peak %u %% of the block budget\n"
+                 "blocks      %u\n"
+                 "underruns   %u        clips %u",
+                 s.filter, s.taps, s.srcRate, s.cpuPercent, s.cpuPeakPercent, s.blocks,
+                 s.underruns, s.clips);
+        gtk_label_set_text(GTK_LABEL(a->stats), buf);
     }
-
-    snprintf(buf, sizeof(buf),
-             "filter      %s\n"
-             "taps        %u @ %u Hz source\n"
-             "dsp load    %u %% now, peak %u %% of the block budget\n"
-             "blocks      %u\n"
-             "underruns   %u        clips %u",
-             s.filter, s.taps, s.srcRate, s.cpuPercent, s.cpuPeakPercent, s.blocks,
-             s.underruns, s.clips);
-    gtk_label_set_text(GTK_LABEL(a->stats), buf);
 
     a->syncing = FALSE;
     return G_SOURCE_CONTINUE;
@@ -227,8 +337,7 @@ static void on_bypass(GtkButton *btn, gpointer user)
 {
     App *a = user;
     const char *err = NULL;
-    const char *lbl = gtk_button_get_label(btn);
-    gboolean nowBypassed = (strstr(lbl, "BYPASSED") != NULL);
+    gboolean nowBypassed = (strstr(gtk_button_get_label(btn), "BYPASSED") != NULL);
 
     if (a->dev != NULL && !rc_set_bypass(a->dev, !nowBypassed, &err))
     {
@@ -242,14 +351,14 @@ static void on_preamp(GtkRange *r, gpointer user)
     App *a = user;
     const char *err = NULL;
 
-    show_value(r, " dB"); /* immediately, not on the next poll */
+    show_value(r);
     if (!a->syncing)
     {
         a->touched[16] = g_get_monotonic_time();
-    }
-    if (!a->syncing && a->dev != NULL && !rc_set_preamp(a->dev, (float)gtk_range_get_value(r), &err))
-    {
-        set_banner(a, err, TRUE);
+        if (a->dev != NULL && !rc_set_preamp(a->dev, (float)gtk_range_get_value(r), &err))
+        {
+            set_banner(a, err, TRUE);
+        }
     }
 }
 
@@ -259,14 +368,14 @@ static void on_eq(GtkRange *r, gpointer user)
     const char *err = NULL;
     int band = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(r), "band"));
 
-    show_value(r, "");
+    show_value(r);
     if (!a->syncing)
     {
         a->touched[band] = g_get_monotonic_time();
-    }
-    if (!a->syncing && a->dev != NULL && !rc_set_eq(a->dev, band, (float)gtk_range_get_value(r), &err))
-    {
-        set_banner(a, err, TRUE);
+        if (a->dev != NULL && !rc_set_eq(a->dev, band, (float)gtk_range_get_value(r), &err))
+        {
+            set_banner(a, err, TRUE);
+        }
     }
 }
 
@@ -278,7 +387,7 @@ static void on_flatten(GtkButton *btn, gpointer user)
 
     for (int b = 0; b < 16; b++)
     {
-        gtk_range_set_value(GTK_RANGE(a->eq[b]), 0.0); /* sends via value-changed */
+        gtk_range_set_value(GTK_RANGE(a->eq[b]), 0.0);
         if (a->dev != NULL && !rc_set_eq(a->dev, b, 0.0f, &err))
         {
             set_banner(a, err, TRUE);
@@ -297,6 +406,10 @@ static void on_reset_stats(GtkButton *btn, gpointer user)
     {
         set_banner(a, err, TRUE);
     }
+    for (int i = 0; i < 4; i++)
+    {
+        a->meter[i].holdDb = RC_FLOOR_DB; /* drop the peak markers too */
+    }
     refresh(a);
 }
 
@@ -304,7 +417,6 @@ static void upload_progress(uint32_t done, uint32_t total, void *user)
 {
     App *a = user;
     gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(a->progress), (double)done / (double)total);
-    /* the whole upload is ~0.2 s, but keep the bar honest anyway */
     while (g_main_context_pending(NULL))
     {
         g_main_context_iteration(NULL, FALSE);
@@ -339,7 +451,7 @@ static void on_ir_chosen(GObject *src, GAsyncResult *res, gpointer user)
                                         upload_progress, a, &err))
     {
         set_banner(a, err ? err : "not connected", TRUE);
-        gtk_label_set_text(GTK_LABEL(a->irLabel), "upload failed");
+        gtk_label_set_text(GTK_LABEL(a->irLabel), err ? err : "upload failed");
     }
     else
     {
@@ -347,14 +459,13 @@ static void on_ir_chosen(GObject *src, GAsyncResult *res, gpointer user)
         if (rc_status(a->dev, &s, &err))
         {
             char msg[160];
-            snprintf(msg, sizeof(msg), "%s: %s", rc_ir_result_text(s.irResult), s.filter);
+            snprintf(msg, sizeof(msg), "loaded: %s", s.filter);
             gtk_label_set_text(GTK_LABEL(a->irLabel), msg);
         }
     }
     gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(a->progress), 0.0);
     g_free(data);
     g_object_unref(file);
-    refresh(a);
 }
 
 static void on_ir_click(GtkButton *btn, gpointer user)
@@ -378,70 +489,23 @@ static void on_ir_click(GtkButton *btn, gpointer user)
 
 /* -------------------------------------------------------------------- ui ---- */
 
-/*
- * One EQ band as a mixer strip: value on top, vertical fader, centre frequency below.
- * GTK vertical ranges run low-at-top by default, so they need inverting to read like a
- * graphic EQ.
- */
-static GtkWidget *eq_column(App *a, int band)
+static GtkWidget *heading(const char *text)
 {
-    GtkWidget *col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    GtkWidget *val = gtk_label_new("+0.0");
-    GtkWidget *hz  = gtk_label_new(kBandLabel[band]);
-
-    a->eq[band]    = gtk_scale_new_with_range(GTK_ORIENTATION_VERTICAL, -12.0, 12.0, 0.5);
-    a->eqVal[band] = val;
-
-    gtk_range_set_inverted(GTK_RANGE(a->eq[band]), TRUE);
-    gtk_scale_set_draw_value(GTK_SCALE(a->eq[band]), FALSE);
-    gtk_scale_add_mark(GTK_SCALE(a->eq[band]), 0.0, GTK_POS_LEFT, NULL);
-    gtk_widget_set_vexpand(a->eq[band], TRUE);
-    gtk_widget_set_size_request(a->eq[band], 34, 190);
-    gtk_widget_set_tooltip_text(a->eq[band], "drag to adjust, double-click to reset to 0 dB");
-
-    g_object_set_data(G_OBJECT(a->eq[band]), "band", GINT_TO_POINTER(band));
-    g_object_set_data(G_OBJECT(a->eq[band]), "valuelabel", val);
-    g_signal_connect(a->eq[band], "value-changed", G_CALLBACK(on_eq), a);
-    add_double_click_reset(a->eq[band]);
-
-    gtk_widget_add_css_class(val, "monospace");
-    gtk_widget_add_css_class(hz, "dim-label");
-    gtk_box_append(GTK_BOX(col), val);
-    gtk_box_append(GTK_BOX(col), a->eq[band]);
-    gtk_box_append(GTK_BOX(col), hz);
-    return col;
-}
-
-static GtkWidget *labelled_row(const char *text, GtkWidget *mid, GtkWidget *right, int labelW)
-{
-    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *l   = gtk_label_new(text);
-
+    GtkWidget *l = gtk_label_new(text);
     gtk_label_set_xalign(GTK_LABEL(l), 0.0f);
-    gtk_widget_set_size_request(l, labelW, -1);
-    gtk_widget_add_css_class(l, "dim-label");
-    gtk_box_append(GTK_BOX(row), l);
-    gtk_widget_set_hexpand(mid, TRUE);
-    gtk_box_append(GTK_BOX(row), mid);
-    if (right != NULL)
-    {
-        gtk_widget_set_size_request(right, 60, -1);
-        gtk_label_set_xalign(GTK_LABEL(right), 1.0f);
-        gtk_box_append(GTK_BOX(row), right);
-    }
-    return row;
+    gtk_widget_add_css_class(l, "heading");
+    return l;
 }
 
 static void activate(GtkApplication *app, gpointer user)
 {
     App *a = user;
-    GtkWidget *box, *scroller, *sect;
 
     a->window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(a->window), "RT1050 Room Correction");
-    gtk_window_set_default_size(GTK_WINDOW(a->window), 860, 860);
+    gtk_window_set_default_size(GTK_WINDOW(a->window), 1020, 780);
 
-    box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_widget_set_margin_top(box, 14);
     gtk_widget_set_margin_bottom(box, 14);
     gtk_widget_set_margin_start(box, 16);
@@ -456,89 +520,64 @@ static void activate(GtkApplication *app, gpointer user)
     g_signal_connect(a->bypassBtn, "clicked", G_CALLBACK(on_bypass), a);
     gtk_box_append(GTK_BOX(box), a->bypassBtn);
 
-    sect = gtk_label_new("Levels");
-    gtk_label_set_xalign(GTK_LABEL(sect), 0.0f);
-    gtk_widget_add_css_class(sect, "heading");
-    gtk_box_append(GTK_BOX(box), sect);
+    /* ---- mixer strip: preamp | EQ | meters ---- */
+    GtkWidget *strip = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
 
-    GtkWidget *meters = gtk_box_new(GTK_ORIENTATION_VERTICAL, 3);
-    for (int i = 0; i < 4; i++)
-    {
-        a->meter[i] = gtk_level_bar_new();
-        gtk_level_bar_set_mode(GTK_LEVEL_BAR(a->meter[i]), GTK_LEVEL_BAR_MODE_CONTINUOUS);
-        gtk_level_bar_set_min_value(GTK_LEVEL_BAR(a->meter[i]), 0.0);
-        gtk_level_bar_set_max_value(GTK_LEVEL_BAR(a->meter[i]), 1.0);
-        /* -6 dBFS and -1 dBFS on a -60..0 scale, so the bar turns as it gets hot */
-        gtk_level_bar_add_offset_value(GTK_LEVEL_BAR(a->meter[i]), GTK_LEVEL_BAR_OFFSET_LOW, 0.90);
-        gtk_level_bar_add_offset_value(GTK_LEVEL_BAR(a->meter[i]), GTK_LEVEL_BAR_OFFSET_HIGH, 0.983);
-        gtk_level_bar_add_offset_value(GTK_LEVEL_BAR(a->meter[i]), GTK_LEVEL_BAR_OFFSET_FULL, 1.0);
-        gtk_widget_set_size_request(a->meter[i], -1, 14);
-
-        a->meterVal[i] = gtk_label_new("  -inf");
-        gtk_widget_add_css_class(a->meterVal[i], "monospace");
-        a->meterDb[i] = RC_METER_FLOOR_DB;
-        gtk_box_append(GTK_BOX(meters),
-                       labelled_row(kMeterName[i], a->meter[i], a->meterVal[i], 64));
-    }
-    gtk_box_append(GTK_BOX(box), meters);
-
-    GtkWidget *scaleHint = gtk_label_new("peak dBFS, -60 to 0");
-    gtk_label_set_xalign(GTK_LABEL(scaleHint), 0.0f);
-    gtk_widget_add_css_class(scaleHint, "dim-label");
-    gtk_box_append(GTK_BOX(box), scaleHint);
-
-    sect = gtk_label_new("Preamp");
-    gtk_label_set_xalign(GTK_LABEL(sect), 0.0f);
-    gtk_widget_add_css_class(sect, "heading");
-    gtk_box_append(GTK_BOX(box), sect);
-
-    a->preamp = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, -40.0, 12.0, 0.5);
-    gtk_scale_set_draw_value(GTK_SCALE(a->preamp), FALSE);
-    gtk_scale_add_mark(GTK_SCALE(a->preamp), 0.0, GTK_POS_BOTTOM, NULL);
-    gtk_widget_set_tooltip_text(a->preamp, "drag to adjust, double-click to reset to 0 dB");
-    a->preampVal = gtk_label_new("+0.0 dB");
-    gtk_widget_add_css_class(a->preampVal, "monospace");
-    g_object_set_data(G_OBJECT(a->preamp), "valuelabel", a->preampVal);
+    GtkWidget *pre = fader_column(&a->preamp, &a->preampVal, "preamp", -40.0, 12.0, 38, TRUE);
     g_signal_connect(a->preamp, "value-changed", G_CALLBACK(on_preamp), a);
-    add_double_click_reset(a->preamp);
-    gtk_box_append(GTK_BOX(box), labelled_row("gain", a->preamp, a->preampVal, 64));
+    gtk_box_append(GTK_BOX(strip), pre);
+    gtk_box_append(GTK_BOX(strip), gtk_separator_new(GTK_ORIENTATION_VERTICAL));
 
-    sect = gtk_label_new("16-band EQ");
-    gtk_label_set_xalign(GTK_LABEL(sect), 0.0f);
-    gtk_widget_add_css_class(sect, "heading");
-    gtk_box_append(GTK_BOX(box), sect);
-
-    GtkWidget *eqBox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
-    gtk_widget_set_halign(eqBox, GTK_ALIGN_FILL);
+    GtkWidget *eqBox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_box_set_homogeneous(GTK_BOX(eqBox), TRUE);
+    gtk_widget_set_hexpand(eqBox, TRUE);
     for (int b = 0; b < 16; b++)
     {
-        gtk_box_append(GTK_BOX(eqBox), eq_column(a, b));
+        GtkWidget *col =
+            fader_column(&a->eq[b], &a->eqVal[b], kBandLabel[b], -12.0, 12.0, 30, FALSE);
+        g_object_set_data(G_OBJECT(a->eq[b]), "band", GINT_TO_POINTER(b));
+        g_signal_connect(a->eq[b], "value-changed", G_CALLBACK(on_eq), a);
+        gtk_box_append(GTK_BOX(eqBox), col);
     }
-    scroller = gtk_scrolled_window_new();
+    gtk_box_append(GTK_BOX(strip), eqBox);
+
+    gtk_box_append(GTK_BOX(strip), gtk_separator_new(GTK_ORIENTATION_VERTICAL));
+    GtkWidget *meters = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    for (int i = 0; i < 4; i++)
+    {
+        gtk_box_append(GTK_BOX(meters), meter_column(a, i));
+    }
+    gtk_box_append(GTK_BOX(strip), meters);
+
+    GtkWidget *scroller = gtk_scrolled_window_new();
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller), GTK_POLICY_AUTOMATIC,
                                    GTK_POLICY_NEVER);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), eqBox);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), strip);
     gtk_widget_set_vexpand(scroller, TRUE);
     gtk_box_append(GTK_BOX(box), scroller);
 
-    GtkWidget *hint = gtk_label_new("double-click any slider to reset it to 0 dB");
+    GtkWidget *hint = gtk_label_new(
+        "faders: double-click to reset to 0 dB     |     meters: peak dBFS, bar falls fast, "
+        "line is a slow peak hold");
     gtk_label_set_xalign(GTK_LABEL(hint), 0.0f);
     gtk_widget_add_css_class(hint, "dim-label");
     gtk_box_append(GTK_BOX(box), hint);
 
-    GtkWidget *flat = gtk_button_new_with_label("Flatten EQ");
+    GtkWidget *btnRow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *flat   = gtk_button_new_with_label("Flatten EQ");
+    GtkWidget *rst    = gtk_button_new_with_label("Reset statistics");
+    GtkWidget *irBtn  = gtk_button_new_with_label("Upload IR .wav ...");
     g_signal_connect(flat, "clicked", G_CALLBACK(on_flatten), a);
-    gtk_box_append(GTK_BOX(box), flat);
-
-    sect = gtk_label_new("Impulse response");
-    gtk_label_set_xalign(GTK_LABEL(sect), 0.0f);
-    gtk_widget_add_css_class(sect, "heading");
-    gtk_box_append(GTK_BOX(box), sect);
-
-    GtkWidget *irBtn = gtk_button_new_with_label("Upload .wav ...");
+    g_signal_connect(rst, "clicked", G_CALLBACK(on_reset_stats), a);
     g_signal_connect(irBtn, "clicked", G_CALLBACK(on_ir_click), a);
-    gtk_box_append(GTK_BOX(box), irBtn);
+    gtk_widget_set_hexpand(flat, TRUE);
+    gtk_widget_set_hexpand(rst, TRUE);
+    gtk_widget_set_hexpand(irBtn, TRUE);
+    gtk_box_append(GTK_BOX(btnRow), flat);
+    gtk_box_append(GTK_BOX(btnRow), rst);
+    gtk_box_append(GTK_BOX(btnRow), irBtn);
+    gtk_box_append(GTK_BOX(box), btnRow);
+
     a->progress = gtk_progress_bar_new();
     gtk_box_append(GTK_BOX(box), a->progress);
     a->irLabel = gtk_label_new("48 or 96 kHz, mono or stereo, PCM 16/24/32 or float32");
@@ -546,16 +585,7 @@ static void activate(GtkApplication *app, gpointer user)
     gtk_widget_add_css_class(a->irLabel, "dim-label");
     gtk_box_append(GTK_BOX(box), a->irLabel);
 
-    sect = gtk_label_new("Status");
-    gtk_label_set_xalign(GTK_LABEL(sect), 0.0f);
-    gtk_widget_add_css_class(sect, "heading");
-    gtk_box_append(GTK_BOX(box), sect);
-
-    GtkWidget *resetBtn = gtk_button_new_with_label("Reset statistics");
-    gtk_widget_set_tooltip_text(resetBtn, "zero the block, underrun, clip and peak-load counters");
-    g_signal_connect(resetBtn, "clicked", G_CALLBACK(on_reset_stats), a);
-    gtk_box_append(GTK_BOX(box), resetBtn);
-
+    gtk_box_append(GTK_BOX(box), heading("Status"));
     a->stats = gtk_label_new("");
     gtk_label_set_xalign(GTK_LABEL(a->stats), 0.0f);
     gtk_label_set_selectable(GTK_LABEL(a->stats), TRUE);
@@ -566,7 +596,7 @@ static void activate(GtkApplication *app, gpointer user)
     gtk_window_present(GTK_WINDOW(a->window));
 
     refresh(a);
-    g_timeout_add(100, refresh, a); /* ~1 ms per read; fast enough for the meters */
+    g_timeout_add(RC_POLL_MS, refresh, a);
 }
 
 int main(int argc, char **argv)
