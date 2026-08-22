@@ -26,6 +26,8 @@
 #include "fsl_wm8960.h"
 #include "fsl_adapter_audio.h"
 #include "fsl_codec_adapter.h"
+#include "roomcorr.h"
+#include "roomcorr_stream.h"
 /*${header:end}*/
 /*${variable:start}*/
 extern usb_audio_speaker_struct_t g_UsbDeviceAudioSpeaker;
@@ -37,6 +39,14 @@ hal_audio_ip_config_t ipTxConfig;
 hal_audio_dma_mux_config_t dmaMuxTxConfig;
 USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE)
 static uint8_t audioPlayDMATempBuff[AUDIO_PLAY_BUFFER_SIZE_ONE_FRAME];
+/*
+ * The SAI DMA is fed from these instead of straight out of the USB ring, because the
+ * audio now goes through the convolver first. Ping-pong so the engine is never reading
+ * the buffer we are refilling. Non-cacheable, like every other DMA-visible buffer here.
+ */
+USB_DMA_NONINIT_DATA_ALIGN(USB_DATA_ALIGN_SIZE)
+static uint8_t audioPlayStageBuff[2][AUDIO_PLAY_BUFFER_SIZE_ONE_FRAME];
+static uint8_t audioPlayStageIdx;
 uint32_t masterClockHz = 0U;
 codec_handle_t codecHandle;
 
@@ -128,6 +138,10 @@ void BOARD_InitHardware(void)
     audioTxConfig.fifoWatermark                  = (uint8_t)(FSL_FEATURE_SAI_FIFO_COUNTn(DEMO_SAI) - 1);
     audioTxConfig.bitWidth                       = (uint8_t)kHAL_AudioWordWidth32bits;
     audioTxConfig.lineChannels                   = kHAL_AudioStereo;
+
+    /* SDRAM is up (boot-header DCD) and BOARD_ConfigMPU() has already marked
+     * 0x80000000 Normal cacheable, because SKIP_SYSCLK_INIT is defined. */
+    RCS_Init();
 }
 
 /*
@@ -218,8 +232,14 @@ static void txCallback(hal_audio_handle_t handle, hal_audio_status_t completionS
 #else
         USB_DeviceCalculateFeedback();
 #endif
-        xfer.dataSize     = g_UsbDeviceAudioSpeaker.audioPlayTransferSize;
-        xfer.data         = audioPlayDataBuff + g_UsbDeviceAudioSpeaker.tdReadNumberPlay;
+        xfer.dataSize = g_UsbDeviceAudioSpeaker.audioPlayTransferSize;
+        /* Hand this chunk to the convolver rather than to the DMA. Everything else in
+         * this function -- the counters the asynchronous feedback loop is built on --
+         * is untouched, so the USB side still sees data being consumed at exactly the
+         * same rate. tdReadNumberPlay never straddles the end of the ring, so a single
+         * contiguous read is safe. */
+        RCS_PushInput(audioPlayDataBuff + g_UsbDeviceAudioSpeaker.tdReadNumberPlay,
+                      xfer.dataSize);
         preAudioSendCount = g_UsbDeviceAudioSpeaker.audioSendCount[0];
         g_UsbDeviceAudioSpeaker.audioSendCount[0] += g_UsbDeviceAudioSpeaker.audioPlayTransferSize;
         if (preAudioSendCount > g_UsbDeviceAudioSpeaker.audioSendCount[0])
@@ -249,8 +269,16 @@ static void txCallback(hal_audio_handle_t handle, hal_audio_status_t completionS
         {
             xfer.dataSize = AUDIO_PLAY_BUFFER_SIZE_ONE_FRAME / 8U;
         }
-        xfer.data = audioPlayDMATempBuff;
+        /* Not streaming: keep clocking silence into the convolver so the filter tail
+         * rings out properly instead of being chopped off. */
+        RCS_PushSilence(xfer.dataSize);
     }
+
+    /* Whatever happened above, the DMA is always served from the processed FIFO. */
+    audioPlayStageIdx ^= 1U;
+    (void)RCS_PopOutput(audioPlayStageBuff[audioPlayStageIdx], xfer.dataSize);
+    xfer.data = audioPlayStageBuff[audioPlayStageIdx];
+
     HAL_AudioTransferSendNonBlocking((hal_audio_handle_t)&audioTxHandle[0], &xfer);
 }
 

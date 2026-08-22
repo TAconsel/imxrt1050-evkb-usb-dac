@@ -162,3 +162,97 @@ BSD-3-Clause to match.
 The MCUXpresso SDK itself is not vendored here — see `.gitignore` for the `west init`
 line that recreates the workspace. The NXP board design files are likewise not
 redistributed; download `RT1050EVKB-DESIGNFILES` from nxp.com.
+
+## Room correction (FFT convolution)
+
+`Test900.wav` (32768 taps, 96 kHz, float32, stereo) is convolved with the audio stream
+in real time on the Cortex-M7.
+
+    .venv/bin/python tools/analyse_ir.py Test900.wav    # what the filter does
+    .venv/bin/python tools/make_filter.py               # -> roomcorr_data.c + .bin
+    .venv/bin/python tools/verify_filter.py             # check the algorithm on the host
+    CFG=flexspi_nor_release ./build.sh usb_dac32 flash
+
+### 96 kHz -> 48 kHz costs no frequency resolution
+The WM8960 tops out at 48 kHz (its SYSCLK is <= 12.288 MHz and the rate divider needs
+SYSCLK/fs >= 256), so the IR has to be resampled. That is **not** a loss of resolution:
+
+| | source | resampled |
+|---|---|---|
+| rate | 96 kHz | 48 kHz |
+| taps | 32768 | 16384 |
+| duration | 341.3 ms | 341.3 ms |
+| **frequency resolution** | **2.93 Hz** | **2.93 Hz** |
+
+Resolution is `1 / duration`, not `1 / taps`. Halving the rate halves the tap count
+because each tap now spans twice as long; the filter still covers 341 ms, so it still
+resolves 2.93 Hz. The only thing discarded is 24-48 kHz, which the codec cannot
+reproduce. Measured magnitude error vs the original, 10 Hz-20 kHz: **0.19 dB rms**.
+
+`resample_poly` preserves *signal* amplitude, which for a *filter* means sum(h) -- and
+so the whole frequency response -- drops by the decimation factor. `make_filter.py`
+multiplies by `dn/up` to compensate; without that the response sat 6.02 dB low.
+
+### What this particular filter does
+It is pure attenuation -- peak response -0.25 dB (L) / -1.15 dB (R), no boost anywhere.
+The deep cuts are exactly where the reported problem is:
+
+| band | ch0 mean | ch1 mean |
+|---|---|---|
+| 20-40 Hz | -13.1 dB | -13.2 dB |
+| **40-80 Hz** | **-19.3 dB** | **-19.0 dB** |
+| 80-160 Hz | -12.2 dB | -12.8 dB |
+| 160 Hz-20 kHz | -4 to -9 dB | -6 to -10 dB |
+
+Worst case sample gain is sum|h| = +6.6 dB, so the output clamps and counts clips; in
+practice the peak response is ~0 dB and the counter stays at zero.
+
+### Algorithm
+Uniform-partitioned overlap-save, stereo, float32, CMSIS-DSP:
+
+    B = 1024 frames, N = 2B = 2048, P = 16 partitions
+    X = rfft([previous block | this block]) -> push into a P-deep delay line
+    Y = sum(p) FDL[head+p] * FILTER[p]      -> complex MAC in CMSIS packed layout
+    y = irfft(Y), keep the second half
+
+Memory (`P * N = 2 * taps` floats per channel, independent of B):
+
+| | size | where |
+|---|---|---|
+| filter | 256 KiB | rodata, HyperFlash |
+| delay line | 256 KiB | SDRAM 0x80000000 |
+| FIFOs + scratch | 64 KiB | SDRAM |
+
+The SDRAM is brought up by the boot header's DCD (`XIP_BOOT_HEADER_DCD_ENABLE=1`), which
+also requires `SKIP_SYSCLK_INIT` so `BOARD_BootClockRUN()` does not re-init the System
+PLL that clocks the SEMC underneath the already-running SDRAM. That same macro makes
+`BOARD_ConfigMPU()` mark 0x80000000 Normal cacheable -- essential, since the block loop
+streams 512 KiB through it every 21 ms.
+
+The SAI DMA callback runs every 125 us and only moves bytes: it pushes what it took from
+the USB ring into an input FIFO and pulls processed audio from an output FIFO. The
+convolution itself runs in the main loop. All of the asynchronous-feedback bookkeeping in
+`txCallback()` is untouched, so the USB side still sees data consumed at the same rate.
+
+### Measured on hardware
+* **Numerically exact.** An impulse through the on-device convolver returns the filter's
+  own IR: peak `299,861,248` at frame 2188, against the host reference `299,860,992` at
+  frame 2188 -- 0.85 ppm apart, i.e. float32 rounding.
+* **24% CPU**: 3,103,290 cycles = 5.17 ms of the 21.33 ms block budget (`-Os`).
+  At `-O0` it is 11.2 ms / 52%, so build release for real use.
+* Steady state: 0 underruns after priming, 0 clips, output FIFO stable at ~1160 frames.
+* Added latency ~100 ms: 45.6 ms of filter pre-delay (the IR peaks at tap 2188) +
+  2 blocks (42.7 ms) + USB buffering. High latency was acceptable here by design.
+
+Two traps worth recording. CMSIS's `arm_rfft_fast_f32` forward/inverse pair round-trips
+at **unity** -- `stage_rfft_f32` and `merge_rfft_f32` each carry 0.5 factors that cancel
+the inverse `1/(N/2)` -- so no compensation is needed; assuming `N/2` overdrove the
+output by ~7x. And DWT `CYCCNT` is useless for this: it sits in the debug power domain,
+which the RT1050 powers down when the probe detaches, so it silently freezes and every
+block then measures 0 cycles. The load counter uses free-running SysTick instead.
+
+### Headroom for a longer filter
+CPU scales with the partition count, memory with `2 * taps`. At 24% for 341 ms there is
+room for roughly a 1 second IR before the block budget gets tight, and SDRAM (32 MB
+against 320 KiB used) is nowhere near a limit. Nothing in the firmware is hard-coded to
+this filter -- `make_filter.py` regenerates `roomcorr_params.h` and the geometry follows.

@@ -8,6 +8,7 @@ mcuxsdk/
 # build outputs
 build/
 */build/
+*/build_*/
 
 # NXP board design files (schematic/gerber/layout/BOM, ~15 MB).
 # Not redistributed here - download RT1050EVKB-DESIGNFILES from nxp.com.

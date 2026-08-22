@@ -30,6 +30,8 @@
 #include "app.h"
 #if ((defined FSL_FEATURE_SOC_USBPHY_COUNT) && (FSL_FEATURE_SOC_USBPHY_COUNT > 0U))
 #include "usb_phy.h"
+#include "roomcorr.h"
+#include "roomcorr_stream.h"
 #endif
 #if defined(USB_DEVICE_AUDIO_USE_SYNC_MODE) && (USB_DEVICE_AUDIO_USE_SYNC_MODE > 0U)
 #include "fsl_ctimer.h"
@@ -1832,13 +1834,28 @@ void main(void)
 {
     BOARD_InitHardware();
 
+    RC_SelfTest();
+
     APPInit();
+
+    uint32_t rcStatsAt = 0U;
 
     while (1)
     {
+        /* Convolution first: the SAI DMA is draining the processed FIFO at 48 kHz and
+         * an underrun there is audible, whereas the USB and codec housekeeping below
+         * can tolerate a few ms of jitter. */
+        RCS_Task();
+
         USB_AudioCodecTask();
 
         USB_AudioSpeakerResetTask();
+
+        if (RC_BlockCount() >= (rcStatsAt + 234U)) /* ~5 s at 21.3 ms per block */
+        {
+            rcStatsAt = RC_BlockCount();
+            RCS_PrintStats();
+        }
 
 #if USB_DEVICE_CONFIG_USE_TASK
         USB_DeviceTaskFn(g_UsbDeviceAudioSpeaker.deviceHandle);

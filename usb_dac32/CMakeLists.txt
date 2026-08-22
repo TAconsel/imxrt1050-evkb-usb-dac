@@ -49,9 +49,30 @@ mcux_add_include(
   INCLUDES "." "board_port"
 )
 
+# The DCD in the boot header is what brings up the SEMC and the 32 MB SDRAM before
+# main() runs; without it 0x80000000 is dead and the convolver has nowhere to live.
+# SKIP_SYSCLK_INIT is mandatory alongside the DCD: the DCD has already set System PLL
+# (PLL2) and its PFDs to clock the SEMC, and letting BOARD_BootClockRUN() re-init them
+# would pull the clock out from under the SDRAM that is already running. It also makes
+# BOARD_ConfigMPU() mark 0x80000000 as Normal cacheable write-back, which the convolver
+# needs -- streaming the delay line through uncached Device memory would be hopeless.
+mcux_add_macro(
+  CC "-DXIP_BOOT_HEADER_DCD_ENABLE=1 -DSKIP_SYSCLK_INIT"
+)
+mcux_add_source(
+  BASE_PATH "${SdkRootDirPath}"
+  SOURCES "${board_root}/${board}/dcd.c"
+)
+
 mcux_add_source(
   BASE_PATH "${CMAKE_CURRENT_LIST_DIR}"
   SOURCES
+    "roomcorr.c"
+    "roomcorr.h"
+    "roomcorr_data.c"
+    "roomcorr_params.h"
+    "roomcorr_stream.c"
+    "roomcorr_stream.h"
     "audio_speaker.c"
     "audio_speaker.h"
     "usb_device_descriptor.c"

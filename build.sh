@@ -20,7 +20,12 @@ case "$APP" in
   usb_dac32) SRC=/home/consel/IMXRT1050-DSP/usb_dac32 ;;
   *)       SRC=$APP ;;                 # or pass an absolute path to any app dir
 esac
-OUT=/home/consel/IMXRT1050-DSP/$APP/build
+# one build dir per config, so switching between debug and release actually
+# reconfigures instead of silently reusing the previous config's objects
+case "$CFG" in
+  flexspi_nor_debug) OUT=/home/consel/IMXRT1050-DSP/$APP/build ;;
+  *)                 OUT=/home/consel/IMXRT1050-DSP/$APP/build_${CFG} ;;
+esac
 
 (cd "$MCUX" && west build -b evkbimxrt1050 "$SRC" \
      --toolchain armgcc --config "$CFG" -d "$OUT")
