@@ -10,8 +10,8 @@ static void show(const rc_usb_status_t *s)
     printf("taps      : %u @ %u Hz source\n", s->taps, s->srcRate);
     printf("correction: %s\n", s->bypass ? "BYPASSED" : "engaged");
     printf("preamp    : %+.1f dB\n", (double)s->preamp);
-    printf("cpu       : %u%%   blocks %u   underruns %u   clips %u\n",
-           s->cpuPercent, s->blocks, s->underruns, s->clips);
+    printf("cpu       : %u%% now, %u%% peak   blocks %u   underruns %u   clips %u\n",
+           s->cpuPercent, s->cpuPeakPercent, s->blocks, s->underruns, s->clips);
     printf("last upload: %s\n", rc_ir_result_text(s->irResult));
     printf("eq        :");
     for (int b = 0; b < s->eqBands; b++)

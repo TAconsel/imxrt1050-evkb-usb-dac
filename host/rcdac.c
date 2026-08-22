@@ -3,9 +3,12 @@
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
+#define _DEFAULT_SOURCE
+
 #include <libusb-1.0/libusb.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include "rcdac.h"
 
 #define RC_TIMEOUT_MS 2000
@@ -132,7 +135,36 @@ bool rc_upload_ir(rc_dev *d, const uint8_t *wav, uint32_t len,
             progress(off + n, len, user);
         }
     }
-    return ctrl_out(d, RC_REQ_IR_COMMIT, 0, 0, NULL, 0, err);
+    if (!ctrl_out(d, RC_REQ_IR_COMMIT, 0, 0, NULL, 0, err))
+    {
+        return false;
+    }
+
+    /*
+     * The board rebuilds the filter from its main loop rather than from the USB
+     * interrupt, so the answer is not ready when COMMIT returns. Poll until it stops
+     * saying "in progress" -- a rebuild is tens of milliseconds, so this is quick.
+     */
+    for (int i = 0; i < 200; i++)
+    {
+        rc_usb_status_t s;
+        if (!rc_status(d, &s, err))
+        {
+            return false;
+        }
+        if (s.irResult != 0xFF)
+        {
+            if (s.irResult != 0)
+            {
+                *err = rc_ir_result_text(s.irResult);
+                return false;
+            }
+            return true;
+        }
+        usleep(10000);
+    }
+    *err = "timed out waiting for the board to rebuild the filter";
+    return false;
 }
 
 const char *rc_ir_result_text(uint8_t code)

@@ -25,6 +25,7 @@ static uint8_t         s_chunk[RC_USB_CHUNK];
 static uint32_t s_irExpected; /* bytes announced by RC_REQ_IR_BEGIN */
 static uint32_t s_irGot;
 static uint8_t  s_irResult;
+static volatile bool s_irPending;
 
 static void usbctl_fill_status(void)
 {
@@ -38,7 +39,8 @@ static void usbctl_fill_status(void)
     s_status.preamp     = RC_EQ_GetPreamp();
     s_status.taps       = RC_FILTER_Taps();
     s_status.srcRate    = RC_FILTER_SourceRate();
-    s_status.cpuPercent = (RC_PeakMicros() * 100U) / budgetUs;
+    s_status.cpuPercent     = (RC_LastMicros() * 100U) / budgetUs;
+    s_status.cpuPeakPercent = (RC_PeakMicros() * 100U) / budgetUs;
     s_status.underruns  = RCS_Underruns();
     s_status.clips      = RC_ClipCount();
     s_status.blocks     = RC_BlockCount();
@@ -66,6 +68,19 @@ static void usbctl_apply_set(void)
         default:
             /* ignore unknown parameters rather than stalling the pipe */
             break;
+    }
+}
+
+void RC_USBCTL_Task(void)
+{
+    if (s_irPending)
+    {
+        s_irPending = false;
+        s_irResult  = (uint8_t)RC_FILTER_LoadWav(s_irGot);
+        /* the rebuild itself is not steady-state load, so do not let it skew the peak */
+        RC_ResetPeak();
+        PRINTF("usbctl: IR upload finished, %u bytes, result %d\r\n",
+               (unsigned)s_irGot, (int)s_irResult);
     }
 }
 
@@ -133,15 +148,8 @@ usb_status_t RC_USBCTL_Handle(usb_device_control_request_struct_t *req)
             {
                 req->buffer = NULL;
                 req->length = 0U;
-                /*
-                 * Rebuilding blocks the caller for a few tens of milliseconds, which is
-                 * longer than the output FIFO holds, so the audio drops out briefly.
-                 * Doing it here rather than deferring keeps the result available to the
-                 * very next status read.
-                 */
-                s_irResult = (uint8_t)RC_FILTER_LoadWav(s_irGot);
-                PRINTF("usbctl: IR upload finished, %u bytes, result %d\r\n",
-                       (unsigned)s_irGot, (int)s_irResult);
+                /* hand the work to the main loop: see RC_USBCTL_Task() */
+                s_irPending = true;
             }
             return kStatus_USB_Success;
 

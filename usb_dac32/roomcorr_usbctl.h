@@ -43,7 +43,8 @@ typedef struct
     float    eq[16];
     uint32_t taps;
     uint32_t srcRate;
-    uint32_t cpuPercent;
+    uint32_t cpuPercent;     /* most recent block */
+    uint32_t cpuPeakPercent;
     uint32_t underruns;
     uint32_t clips;
     uint32_t blocks;
@@ -66,6 +67,16 @@ typedef struct
  * @return kStatus_USB_Success if the request was ours, kStatus_USB_InvalidRequest to stall.
  */
 usb_status_t RC_USBCTL_Handle(usb_device_control_request_struct_t *req);
+
+/*!
+ * @brief Main-loop half of the control interface.
+ *
+ * Rebuilding a filter takes tens of milliseconds. RC_USBCTL_Handle() runs in the USB
+ * interrupt, so doing it there would stall every other interrupt on the part, including
+ * the SAI DMA completion that feeds the codec. COMMIT therefore only raises a flag and
+ * this does the work; the host sees irResult go from "in progress" to a result code.
+ */
+void RC_USBCTL_Task(void);
 #endif
 
 #endif /* _ROOMCORR_USBCTL_H_ */

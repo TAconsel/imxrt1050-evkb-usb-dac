@@ -41,6 +41,10 @@ uint32_t RC_LastCycles(void);
 uint32_t RC_PeakCycles(void);
 /*! Peak block cost in microseconds. */
 uint32_t RC_PeakMicros(void);
+/*! Cost of the most recent block, in microseconds. */
+uint32_t RC_LastMicros(void);
+/*! Forget the peak, e.g. after a one-off event that is not steady-state load. */
+void RC_ResetPeak(void);
 /*! Samples clamped at the output since boot. */
 uint32_t RC_ClipCount(void);
 /*! Blocks processed since boot. */

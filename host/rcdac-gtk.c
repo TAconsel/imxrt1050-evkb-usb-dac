@@ -32,7 +32,62 @@ typedef struct
     GtkWidget   *progress;
     GtkWidget   *banner;
     gboolean     syncing;   /* suppress change handlers while pushing device state in */
+    /*
+     * When a slider was last moved by the user, index 16 being the preamp. At a 200 ms
+     * poll, relying on keyboard focus alone to decide "don't overwrite this one" is too
+     * fragile -- a touchpad drag may not focus the widget -- so a short grace period
+     * after any user movement keeps the poll from snapping the slider back mid-gesture.
+     */
+    gint64       touched[17];
 } App;
+
+#define RC_TOUCH_GRACE_US (700000) /* 0.7 s */
+
+static gboolean recently_touched(App *a, int idx)
+{
+    return (g_get_monotonic_time() - a->touched[idx]) < RC_TOUCH_GRACE_US;
+}
+
+/* Label the slider owns, so a handler can refresh it without waiting for the poll. */
+static void show_value(GtkRange *r, const char *suffix)
+{
+    GtkWidget *lbl = g_object_get_data(G_OBJECT(r), "valuelabel");
+    char buf[32];
+
+    if (lbl != NULL)
+    {
+        snprintf(buf, sizeof(buf), "%+.1f%s", gtk_range_get_value(r), suffix);
+        gtk_label_set_text(GTK_LABEL(lbl), buf);
+    }
+}
+
+static void on_double_click(GtkGestureClick *g, gint n_press, gdouble x, gdouble y,
+                            gpointer user)
+{
+    (void)x;
+    (void)y;
+    if (n_press == 2)
+    {
+        gtk_range_set_value(GTK_RANGE(user), 0.0);
+        gtk_gesture_set_state(GTK_GESTURE(g), GTK_EVENT_SEQUENCE_CLAIMED);
+    }
+}
+
+/*! Double-clicking anywhere on a slider snaps it back to 0 dB. */
+static void add_double_click_reset(GtkWidget *scale)
+{
+    GtkGesture *g = gtk_gesture_click_new();
+
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(g), GDK_BUTTON_PRIMARY);
+    /*
+     * Capture phase on purpose. GtkScale has its own click and drag gestures; in the
+     * bubble phase they claim the sequence first and the second press never reaches us.
+     * Capturing lets single clicks fall through untouched and only intercepts the pair.
+     */
+    gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(g), GTK_PHASE_CAPTURE);
+    g_signal_connect(g, "pressed", G_CALLBACK(on_double_click), scale);
+    gtk_widget_add_controller(scale, GTK_EVENT_CONTROLLER(g));
+}
 
 static void set_banner(App *a, const char *msg, gboolean bad)
 {
@@ -77,32 +132,31 @@ static gboolean refresh(gpointer user)
     gtk_widget_remove_css_class(a->bypassBtn, s.bypass ? "suggested-action" : "destructive-action");
     gtk_widget_add_css_class(a->bypassBtn, s.bypass ? "destructive-action" : "suggested-action");
 
-    /* don't fight the user while they are dragging a slider */
-    GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(a->window));
-    if (focus != a->preamp)
+    if (!recently_touched(a, 16))
     {
         gtk_range_set_value(GTK_RANGE(a->preamp), s.preamp);
+        snprintf(buf, sizeof(buf), "%+.1f dB", (double)s.preamp);
+        gtk_label_set_text(GTK_LABEL(a->preampVal), buf);
     }
-    snprintf(buf, sizeof(buf), "%+.1f dB", (double)s.preamp);
-    gtk_label_set_text(GTK_LABEL(a->preampVal), buf);
 
     for (int b = 0; b < 16 && b < s.eqBands; b++)
     {
-        if (focus != a->eq[b])
+        if (!recently_touched(a, b))
         {
             gtk_range_set_value(GTK_RANGE(a->eq[b]), s.eq[b]);
+            snprintf(buf, sizeof(buf), "%+.1f", (double)s.eq[b]);
+            gtk_label_set_text(GTK_LABEL(a->eqVal[b]), buf);
         }
-        snprintf(buf, sizeof(buf), "%+.1f", (double)s.eq[b]);
-        gtk_label_set_text(GTK_LABEL(a->eqVal[b]), buf);
     }
 
     snprintf(buf, sizeof(buf),
              "filter      %s\n"
              "taps        %u @ %u Hz source\n"
-             "dsp load    %u %% of the block budget\n"
+             "dsp load    %u %% now, peak %u %% of the block budget\n"
              "blocks      %u\n"
              "underruns   %u        clips %u",
-             s.filter, s.taps, s.srcRate, s.cpuPercent, s.blocks, s.underruns, s.clips);
+             s.filter, s.taps, s.srcRate, s.cpuPercent, s.cpuPeakPercent, s.blocks,
+             s.underruns, s.clips);
     gtk_label_set_text(GTK_LABEL(a->stats), buf);
 
     a->syncing = FALSE;
@@ -129,6 +183,12 @@ static void on_preamp(GtkRange *r, gpointer user)
 {
     App *a = user;
     const char *err = NULL;
+
+    show_value(r, " dB"); /* immediately, not on the next poll */
+    if (!a->syncing)
+    {
+        a->touched[16] = g_get_monotonic_time();
+    }
     if (!a->syncing && a->dev != NULL && !rc_set_preamp(a->dev, (float)gtk_range_get_value(r), &err))
     {
         set_banner(a, err, TRUE);
@@ -141,6 +201,11 @@ static void on_eq(GtkRange *r, gpointer user)
     const char *err = NULL;
     int band = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(r), "band"));
 
+    show_value(r, "");
+    if (!a->syncing)
+    {
+        a->touched[band] = g_get_monotonic_time();
+    }
     if (!a->syncing && a->dev != NULL && !rc_set_eq(a->dev, band, (float)gtk_range_get_value(r), &err))
     {
         set_banner(a, err, TRUE);
@@ -155,13 +220,13 @@ static void on_flatten(GtkButton *btn, gpointer user)
 
     for (int b = 0; b < 16; b++)
     {
+        gtk_range_set_value(GTK_RANGE(a->eq[b]), 0.0); /* sends via value-changed */
         if (a->dev != NULL && !rc_set_eq(a->dev, b, 0.0f, &err))
         {
             set_banner(a, err, TRUE);
             break;
         }
     }
-    refresh(a);
 }
 
 static void upload_progress(uint32_t done, uint32_t total, void *user)
@@ -242,6 +307,40 @@ static void on_ir_click(GtkButton *btn, gpointer user)
 
 /* -------------------------------------------------------------------- ui ---- */
 
+/*
+ * One EQ band as a mixer strip: value on top, vertical fader, centre frequency below.
+ * GTK vertical ranges run low-at-top by default, so they need inverting to read like a
+ * graphic EQ.
+ */
+static GtkWidget *eq_column(App *a, int band)
+{
+    GtkWidget *col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    GtkWidget *val = gtk_label_new("+0.0");
+    GtkWidget *hz  = gtk_label_new(kBandLabel[band]);
+
+    a->eq[band]    = gtk_scale_new_with_range(GTK_ORIENTATION_VERTICAL, -12.0, 12.0, 0.5);
+    a->eqVal[band] = val;
+
+    gtk_range_set_inverted(GTK_RANGE(a->eq[band]), TRUE);
+    gtk_scale_set_draw_value(GTK_SCALE(a->eq[band]), FALSE);
+    gtk_scale_add_mark(GTK_SCALE(a->eq[band]), 0.0, GTK_POS_LEFT, NULL);
+    gtk_widget_set_vexpand(a->eq[band], TRUE);
+    gtk_widget_set_size_request(a->eq[band], 34, 190);
+    gtk_widget_set_tooltip_text(a->eq[band], "drag to adjust, double-click to reset to 0 dB");
+
+    g_object_set_data(G_OBJECT(a->eq[band]), "band", GINT_TO_POINTER(band));
+    g_object_set_data(G_OBJECT(a->eq[band]), "valuelabel", val);
+    g_signal_connect(a->eq[band], "value-changed", G_CALLBACK(on_eq), a);
+    add_double_click_reset(a->eq[band]);
+
+    gtk_widget_add_css_class(val, "monospace");
+    gtk_widget_add_css_class(hz, "dim-label");
+    gtk_box_append(GTK_BOX(col), val);
+    gtk_box_append(GTK_BOX(col), a->eq[band]);
+    gtk_box_append(GTK_BOX(col), hz);
+    return col;
+}
+
 static GtkWidget *labelled_row(const char *text, GtkWidget *mid, GtkWidget *right, int labelW)
 {
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
@@ -269,7 +368,7 @@ static void activate(GtkApplication *app, gpointer user)
 
     a->window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(a->window), "RT1050 Room Correction");
-    gtk_window_set_default_size(GTK_WINDOW(a->window), 620, 780);
+    gtk_window_set_default_size(GTK_WINDOW(a->window), 860, 700);
 
     box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_widget_set_margin_top(box, 14);
@@ -293,8 +392,13 @@ static void activate(GtkApplication *app, gpointer user)
 
     a->preamp = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, -40.0, 12.0, 0.5);
     gtk_scale_set_draw_value(GTK_SCALE(a->preamp), FALSE);
-    g_signal_connect(a->preamp, "value-changed", G_CALLBACK(on_preamp), a);
+    gtk_scale_add_mark(GTK_SCALE(a->preamp), 0.0, GTK_POS_BOTTOM, NULL);
+    gtk_widget_set_tooltip_text(a->preamp, "drag to adjust, double-click to reset to 0 dB");
     a->preampVal = gtk_label_new("+0.0 dB");
+    gtk_widget_add_css_class(a->preampVal, "monospace");
+    g_object_set_data(G_OBJECT(a->preamp), "valuelabel", a->preampVal);
+    g_signal_connect(a->preamp, "value-changed", G_CALLBACK(on_preamp), a);
+    add_double_click_reset(a->preamp);
     gtk_box_append(GTK_BOX(box), labelled_row("gain", a->preamp, a->preampVal, 64));
 
     sect = gtk_label_new("16-band EQ");
@@ -302,23 +406,24 @@ static void activate(GtkApplication *app, gpointer user)
     gtk_widget_add_css_class(sect, "heading");
     gtk_box_append(GTK_BOX(box), sect);
 
-    GtkWidget *eqBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    GtkWidget *eqBox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+    gtk_widget_set_halign(eqBox, GTK_ALIGN_FILL);
+    gtk_box_set_homogeneous(GTK_BOX(eqBox), TRUE);
     for (int b = 0; b < 16; b++)
     {
-        char lbl[16];
-        a->eq[b] = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, -12.0, 12.0, 0.5);
-        gtk_scale_set_draw_value(GTK_SCALE(a->eq[b]), FALSE);
-        gtk_scale_add_mark(GTK_SCALE(a->eq[b]), 0.0, GTK_POS_BOTTOM, NULL);
-        g_object_set_data(G_OBJECT(a->eq[b]), "band", GINT_TO_POINTER(b));
-        g_signal_connect(a->eq[b], "value-changed", G_CALLBACK(on_eq), a);
-        a->eqVal[b] = gtk_label_new("+0.0");
-        snprintf(lbl, sizeof(lbl), "%s Hz", kBandLabel[b]);
-        gtk_box_append(GTK_BOX(eqBox), labelled_row(lbl, a->eq[b], a->eqVal[b], 64));
+        gtk_box_append(GTK_BOX(eqBox), eq_column(a, b));
     }
     scroller = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller), GTK_POLICY_AUTOMATIC,
+                                   GTK_POLICY_NEVER);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), eqBox);
     gtk_widget_set_vexpand(scroller, TRUE);
     gtk_box_append(GTK_BOX(box), scroller);
+
+    GtkWidget *hint = gtk_label_new("double-click any slider to reset it to 0 dB");
+    gtk_label_set_xalign(GTK_LABEL(hint), 0.0f);
+    gtk_widget_add_css_class(hint, "dim-label");
+    gtk_box_append(GTK_BOX(box), hint);
 
     GtkWidget *flat = gtk_button_new_with_label("Flatten EQ");
     g_signal_connect(flat, "clicked", G_CALLBACK(on_flatten), a);
@@ -354,7 +459,7 @@ static void activate(GtkApplication *app, gpointer user)
     gtk_window_present(GTK_WINDOW(a->window));
 
     refresh(a);
-    g_timeout_add(1000, refresh, a);
+    g_timeout_add(200, refresh, a); /* a status read is ~1 ms, so this is cheap */
 }
 
 int main(int argc, char **argv)

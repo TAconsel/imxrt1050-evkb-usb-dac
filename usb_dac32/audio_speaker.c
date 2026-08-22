@@ -1857,6 +1857,8 @@ void main(void)
 
         RC_UI_Task();
 
+        RC_USBCTL_Task();
+
         USB_AudioCodecTask();
 
         USB_AudioSpeakerResetTask();

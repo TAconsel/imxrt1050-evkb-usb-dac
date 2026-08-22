@@ -243,6 +243,9 @@ void RC_ProcessBlock(const int32_t *in, int32_t *out)
 
 uint32_t RC_LastCycles(void)  { return s_lastCycles; }
 uint32_t RC_PeakMicros(void)  { return s_peakCycles / RC_TICKS_PER_US; }
+uint32_t RC_LastMicros(void)  { return s_lastCycles / RC_TICKS_PER_US; }
+/* seed with the last block so the peak is never briefly below the current load */
+void     RC_ResetPeak(void)   { s_peakCycles = s_lastCycles; }
 uint32_t RC_PeakCycles(void)  { return s_peakCycles; }
 uint32_t RC_ClipCount(void)   { return s_clipCount; }
 uint32_t RC_BlockCount(void)  { return s_blockCount; }

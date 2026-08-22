@@ -377,14 +377,45 @@ and `IR_BEGIN` / `IR_DATA` / `IR_COMMIT` for uploads. Install
 
     SUBSYSTEM=="usb", ATTR{idVendor}=="1fc9", ATTR{idProduct}=="0098", MODE="0666"
 
+### Control panel behaviour
+* **EQ is 16 vertical faders**, mixer-strip style: value on top, fader, centre frequency
+  below. GTK vertical ranges run low-at-top by default, so they are inverted to read the
+  way a graphic EQ should.
+* **Double-click any fader (or the preamp) to reset it to 0 dB.** The gesture is attached
+  in the *capture* phase on purpose: `GtkScale` has its own click and drag gestures, and
+  in the bubble phase they claim the sequence first so the second press never arrives.
+* Slider labels update **immediately** from the change handler rather than waiting for
+  the poll, and the poll itself runs at 200 ms (a status read is about 1 ms).
+* At that rate, relying on keyboard focus to decide "don't overwrite this slider" is too
+  fragile -- a touchpad drag may not focus the widget -- so any user movement gives that
+  slider a 0.7 s grace period during which the poll leaves it alone.
+
 ### Verified over USB
 * Status read live from the running DAC while audio plays.
 * Bypass, preamp and individual EQ bands all apply immediately.
 * **262,188-byte IR uploaded in 0.16 s**, decimated 96 -> 48 kHz on the board, accepted
   as `uploaded, 16384 taps @96000 Hz src`, result `ok`.
-* Underruns step once per upload (219 -> 801) because rebuilding the filter blocks the
-  main loop for longer than the output FIFO holds. Expected, and documented in the UI.
+* 48 kHz and 96 kHz sources both accepted; a non-WAV is rejected with
+  `not a RIFF/WAVE file` rather than being loaded as noise.
+* Running the GUI for six seconds with no interaction changes **nothing** on the device
+  -- checked field by field before and after.
 * Clips stayed 0 throughout.
+
+Underruns step once per upload, by about 320. That is not a leak: the rebuild blocks the
+main loop for roughly 40 ms, and the SAI callback runs every 125 us, so 40 ms / 125 us is
+almost exactly the step. With the board idle the counter is flat.
+
+The rebuild originally ran inside `RC_USBCTL_Handle()`, which executes in the **USB
+interrupt** -- tens of milliseconds with interrupts blocked, stalling the SAI DMA
+completion that feeds the codec. `RC_REQ_IR_COMMIT` now only raises a flag and
+`RC_USBCTL_Task()` does the work from the main loop; the host polls until the result
+stops reading "in progress".
+
+DSP load is reported as **current and peak** rather than peak alone, since a one-off
+event like a rebuild otherwise pins the peak somewhere unrepresentative forever. The peak
+is reseeded from the last block after a filter load. Steady state is 24 % with the
+built-in filter and 34 % with an uploaded one -- the built-in lives in XIP flash while an
+upload lives in SDRAM, where it contends with the delay line for the 32 KB D-cache.
 
 ### D18 works again
 With Ethernet gone, `GPIO_AD_B0_09` is no longer needed for `ENET_RST`, so **D18 is back
