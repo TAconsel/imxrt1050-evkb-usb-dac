@@ -17,6 +17,8 @@
 #include <string.h>
 #include "fsl_debug_console.h"
 #include "roomcorr.h"
+#include "roomcorr_eq.h"
+#include "roomcorr_filter.h"
 
 extern const float32_t rc_filter[RC_CHANNELS * RC_PARTITIONS * RC_FFT_SIZE];
 
@@ -72,6 +74,7 @@ static float32_t s_prev[RC_CHANNELS][RC_BLOCK];
 static float32_t s_time[RC_FFT_SIZE];
 static float32_t s_freq[RC_FFT_SIZE];
 static float32_t s_acc[RC_FFT_SIZE];
+static float32_t s_mixBuf[RC_BLOCK]; /* one channel, post-mix, pre-EQ */
 
 /*
  * Wet/dry mix. The convolution runs unconditionally, even when bypassed: the delay line
@@ -93,9 +96,9 @@ static inline float32_t *fdl_slot(uint32_t ch, uint32_t part)
     return s_fdl + ((ch * RC_PARTITIONS) + part) * RC_FFT_SIZE;
 }
 
-static inline const float32_t *filter_part(uint32_t ch, uint32_t part)
+static inline const float32_t *filter_part(const float32_t *base, uint32_t ch, uint32_t part)
 {
-    return rc_filter + ((ch * RC_PARTITIONS) + part) * RC_FFT_SIZE;
+    return base + (((ch * RC_PARTITIONS) + part) * RC_FFT_SIZE);
 }
 
 /* ------------------------------------------------------------ arithmetic ---- */
@@ -149,6 +152,10 @@ void RC_ProcessBlock(const int32_t *in, int32_t *out)
     const uint32_t t0     = rc_now();
     const float32_t gStart = s_mix;
     const float32_t gStep  = (s_mixTarget - s_mix) / (float32_t)RC_BLOCK;
+    const float32_t preamp = RC_EQ_PreampLinear();
+    /* snapshot once: an upload can swap this pointer between blocks, and half a block
+     * of one filter followed by half of another would be an audible discontinuity */
+    const float32_t *const filt = RC_FILTER_Active();
 
     /* one step back: slot s_head holds the newest spectrum */
     s_head = (s_head + RC_PARTITIONS - 1U) % RC_PARTITIONS;
@@ -170,7 +177,7 @@ void RC_ProcessBlock(const int32_t *in, int32_t *out)
         for (uint32_t p = 0U; p < RC_PARTITIONS; p++)
         {
             const uint32_t slot = (s_head + p) % RC_PARTITIONS;
-            rc_cmac_packed(s_acc, fdl_slot(ch, slot), filter_part(ch, p));
+            rc_cmac_packed(s_acc, fdl_slot(ch, slot), filter_part(filt, ch, p));
         }
 
         arm_rfft_fast_f32(&s_fft, s_acc, s_freq, 1);
@@ -181,9 +188,17 @@ void RC_ProcessBlock(const int32_t *in, int32_t *out)
         {
             const float32_t wet = s_freq[RC_BLOCK + i] * RC_IFFT_COMPENSATION;
             const float32_t dry = (float32_t)in[(i * RC_CHANNELS) + ch] * RC_INT_TO_FLOAT;
-            float32_t v = ((wet * g) + (dry * (1.0f - g))) * RC_FLOAT_TO_INT;
 
+            s_mixBuf[i] = ((wet * g) + (dry * (1.0f - g))) * preamp;
             g += gStep;
+        }
+
+        /* tone controls sit after the calibration and apply either way */
+        RC_EQ_Process(ch, s_mixBuf, RC_BLOCK);
+
+        for (uint32_t i = 0U; i < RC_BLOCK; i++)
+        {
+            float32_t v = s_mixBuf[i] * RC_FLOAT_TO_INT;
 
             if (v >= 2147483647.0f)
             {

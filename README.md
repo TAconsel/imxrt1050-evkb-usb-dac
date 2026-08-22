@@ -300,3 +300,46 @@ handing the pin back:
 
 Still 24-25% CPU, 0 clips, and no new underruns in either mode. Confirm the physical
 press yourself -- I could only drive the pin, not push the switch.
+
+## 16-band EQ and preamp
+
+Sixteen peaking biquads per channel (ISO centres 20 Hz .. 20 kHz, Q = 1.4, +/-12 dB) plus
+a -40..+12 dB preamp, applied **after** the convolution and **regardless of bypass** --
+they are tone and level controls, not part of the calibration.
+
+Deliberately not folded into the convolution filter. Multiplying each partition spectrum
+by the EQ response is only equivalent to convolving with it when the EQ's impulse
+response fits inside one partition (B = 1024 taps, 21 ms), and a 20 Hz bell decays far
+more slowly than that. Sixteen biquads per channel costs ~15 Mflop/s at 48 kHz, nothing
+next to the convolution, and it is exact. Coefficients are recomputed on change and take
+effect at the next block boundary, since the web handler and the DSP share the main loop.
+
+## Runtime filter store and IR upload
+
+The built-in filter stays in flash as the fallback. An uploaded IR is decoded into one of
+two SDRAM slots and swapped in by a single pointer store; `RC_ProcessBlock()` snapshots
+that pointer once per block, so a block is never built from half of each filter.
+
+`RC_FILTER_LoadWav()` accepts RIFF/WAVE, PCM 16/24/32-bit or IEEE float32, mono or
+stereo, at 48 kHz or 96 kHz. Mono is duplicated to both channels. 96 kHz is decimated by
+two on-device through the 127-tap FIR in `roomcorr_resample.h`. An IR longer than
+`RC_TAPS` is rejected rather than truncated -- a truncated room correction is a different
+filter, not a worse one.
+
+Rebuilding the filter blocks the main loop for a few tens of milliseconds, so audio will
+glitch briefly when a new IR is loaded. That is a deliberate trade for much simpler code;
+the FIFO underrun path already degrades to silence rather than misbehaving.
+
+### The on-device decimator is exact
+`tools/verify_decimator.py` transcribes `decimate_half()` literally -- same taps, same
+delay, same x2 -- and compares against the original 96 kHz response:
+
+| | vs original 96 kHz | vs host `make_filter.py` |
+|---|---|---|
+| ch0 | max **0.001 dB**, rms 0.0002 dB | max 1.154 dB, rms 0.191 dB |
+| ch1 | max **0.001 dB**, rms 0.0002 dB | max 1.159 dB, rms 0.190 dB |
+
+The device path reproduces the source response essentially perfectly. The larger figure
+against the host tool is the *host tool's* own error -- `resample_poly`'s Kaiser window
+rolls off approaching 20 kHz -- so a filter built on the board is slightly more faithful
+than one built by the script.

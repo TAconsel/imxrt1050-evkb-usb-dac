@@ -18,6 +18,8 @@
 #include <string.h>
 #include "fsl_debug_console.h"
 #include "roomcorr.h"
+#include "roomcorr_eq.h"
+#include "roomcorr_filter.h"
 #include "roomcorr_stream.h"
 
 #define RCS_FIFO_BLOCKS  (3U)
@@ -105,6 +107,10 @@ void RCS_Init(void)
     s_blkIn   = (int32_t *)(void *)p; p += RCS_BLOCK_BYTES;
     s_blkOut  = (int32_t *)(void *)p; p += RCS_BLOCK_BYTES;
 
+    /* the filter store takes the rest of what we need: upload staging, decode scratch
+     * and the two swappable partition slots */
+    RC_FILTER_Init(p, (void **)&p);
+
     s_in.head = s_in.tail = 0U;
     s_out.head = s_out.tail = 0U;
     s_underruns = 0U;
@@ -112,6 +118,7 @@ void RCS_Init(void)
     memset(s_in.buf, 0, RCS_FIFO_BYTES);
     memset(s_out.buf, 0, RCS_FIFO_BYTES);
 
+    RC_EQ_Init();
     RC_Init();
 
     PRINTF("room correction: SDRAM 0x%08x..0x%08x (%d KiB)\r\n",
