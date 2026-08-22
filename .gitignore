@@ -13,3 +13,8 @@ build/
 # NXP board design files (schematic/gerber/layout/BOM, ~15 MB).
 # Not redistributed here - download RT1050EVKB-DESIGNFILES from nxp.com.
 RT1050EVKB-DESIGNFILES/
+
+# host app build output
+host/rcdac-cli
+host/rcdac-gtk
+host/*.o

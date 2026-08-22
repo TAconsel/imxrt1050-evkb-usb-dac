@@ -32,8 +32,9 @@
 #include "usb_phy.h"
 #include "roomcorr.h"
 #include "roomcorr_stream.h"
-#include "roomcorr_net.h"
 #include "roomcorr_ui.h"
+#define RC_USBCTL_FIRMWARE
+#include "roomcorr_usbctl.h"
 #endif
 #if defined(USB_DEVICE_AUDIO_USE_SYNC_MODE) && (USB_DEVICE_AUDIO_USE_SYNC_MODE > 0U)
 #include "fsl_ctimer.h"
@@ -1245,6 +1246,11 @@ usb_status_t USB_DeviceCallback(usb_device_handle handle, uint32_t event, void *
 
     switch (event)
     {
+        case kUSB_DeviceEventVendorRequest:
+            /* the host control app: see roomcorr_usbctl.h */
+            error = RC_USBCTL_Handle((usb_device_control_request_struct_t *)param);
+            break;
+
         case kUSB_DeviceEventBusReset:
         {
             for (count = 0U; count < USB_AUDIO_SPEAKER_INTERFACE_COUNT; count++)
@@ -1840,9 +1846,6 @@ void main(void)
 
     APPInit();
 
-    /* after the USB stack, to see whether its clock setup disturbs ENET */
-    RC_NET_Init();
-
     uint32_t rcStatsAt = 0U;
 
     while (1)
@@ -1853,8 +1856,6 @@ void main(void)
         RCS_Task();
 
         RC_UI_Task();
-
-        RC_NET_Task();
 
         USB_AudioCodecTask();
 

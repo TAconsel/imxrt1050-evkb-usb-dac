@@ -24,26 +24,38 @@
 static uint8_t  s_stable;      /* last believed level */
 static uint8_t  s_candidate;   /* level currently being confirmed */
 static uint32_t s_count;
+static bool     s_ledOn;
+
+static void ui_set_led(bool on)
+{
+    /* D18 is active low: driving the pin low lights it. */
+    GPIO_PinWrite(BOARD_USER_LED_GPIO, BOARD_USER_LED_GPIO_PIN, on ? LOGIC_LED_ON : LOGIC_LED_OFF);
+    s_ledOn = on;
+}
 
 void RC_UI_Init(void)
 {
-    gpio_pin_config_t swConfig = {kGPIO_DigitalInput, 0, kGPIO_NoIntmode};
+    gpio_pin_config_t swConfig  = {kGPIO_DigitalInput, 0, kGPIO_NoIntmode};
+    gpio_pin_config_t ledConfig = {kGPIO_DigitalOutput, LOGIC_LED_OFF, kGPIO_NoIntmode};
 
-    /* The audio example's pin_mux.c does not touch SW8, so mux it here. */
+    /*
+     * Neither pin is touched by the audio example's pin_mux.c, so mux them here.
+     * D18 is usable again now that Ethernet is gone -- GPIO_AD_B0_09 is shared with
+     * ENET_RST, and driving the LED would have held the PHY in reset. It is still
+     * JTAG_TDI, so a live debug session will see interference while the LED is driven.
+     */
     IOMUXC_SetPinMux(IOMUXC_SNVS_WAKEUP_GPIO5_IO00, 0U);
+    IOMUXC_SetPinMux(IOMUXC_GPIO_AD_B0_09_GPIO1_IO09, 0U);
+    IOMUXC_SetPinConfig(IOMUXC_GPIO_AD_B0_09_GPIO1_IO09, 0x10B0U);
     GPIO_PinInit(BOARD_USER_BUTTON_GPIO, BOARD_USER_BUTTON_GPIO_PIN, &swConfig);
+    GPIO_PinInit(BOARD_USER_LED_GPIO, BOARD_USER_LED_GPIO_PIN, &ledConfig);
 
     s_stable    = (uint8_t)GPIO_PinRead(BOARD_USER_BUTTON_GPIO, BOARD_USER_BUTTON_GPIO_PIN);
     s_candidate = s_stable;
     s_count     = 0U;
 
-    /*
-     * D18 is deliberately NOT driven here. Its net is GPIO_AD_B0_09, which is also the
-     * KSZ8081 reset -- both active low, so lighting the LED would hold the PHY in reset
-     * and kill the network. roomcorr_net.c owns that pin and parks it high; the
-     * correction state is reported over HTTP and on this console instead.
-     */
-    PRINTF("%s toggles room correction (D18 unavailable: shared with ENET_RST)\r\n",
+    ui_set_led(!RC_GetBypass());
+    PRINTF("%s toggles room correction, D18 lit = correction engaged\r\n",
            BOARD_USER_BUTTON_NAME);
 }
 
@@ -69,6 +81,7 @@ void RC_UI_Task(void)
             {
                 const bool bypass = !RC_GetBypass();
                 RC_SetBypass(bypass);
+                ui_set_led(!bypass);
                 PRINTF("room correction %s\r\n", bypass ? "BYPASSED" : "engaged");
             }
         }
@@ -76,5 +89,11 @@ void RC_UI_Task(void)
     else
     {
         s_count = 0U;
+    }
+
+    /* the host app can change the mode too, so keep the LED honest either way */
+    if (s_ledOn == RC_GetBypass())
+    {
+        ui_set_led(!RC_GetBypass());
     }
 }
