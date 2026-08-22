@@ -1838,9 +1838,10 @@ void main(void)
 
     RC_SelfTest();
 
-    RC_NET_Init();
-
     APPInit();
+
+    /* after the USB stack, to see whether its clock setup disturbs ENET */
+    RC_NET_Init();
 
     uint32_t rcStatsAt = 0U;
 

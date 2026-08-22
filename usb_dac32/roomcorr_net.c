@@ -104,6 +104,16 @@ static void net_init_pins(void)
      */
     IOMUXC_SetPinMux(IOMUXC_GPIO_AD_B0_09_GPIO1_IO09, 0U);
     IOMUXC_SetPinConfig(IOMUXC_GPIO_AD_B0_09_GPIO1_IO09, 0xB0A9U);
+
+    /*
+     * GPIO_AD_B0_10 is ENET_INT, which on the KSZ8081 is INTRP/NAND_TREE#. It is sampled
+     * when reset is released: low puts the PHY into NAND-tree test mode, where MDIO still
+     * answers normally but the analog side is dead, so autonegotiation never completes
+     * and the link never comes up. Leaving the pin unconfigured lets it float into
+     * exactly that state, so give it the same 100K pull-up the SDK example uses.
+     */
+    IOMUXC_SetPinMux(IOMUXC_GPIO_AD_B0_10_GPIO1_IO10, 0U);
+    IOMUXC_SetPinConfig(IOMUXC_GPIO_AD_B0_10_GPIO1_IO10, 0xB0A9U);
 }
 
 /* ------------------------------------------------------------------ http ---- */
@@ -436,7 +446,7 @@ void RC_NET_Init(void)
 {
     const clock_enet_pll_config_t pll = {.enableClkOutput = true, .enableClkOutput25M = false,
                                          .loopDivider = 1};
-    ethernetif_config_t cfg = {.phyHandle   = &s_phyHandle,
+    static ethernetif_config_t cfg = {.phyHandle   = &s_phyHandle,
                                .phyAddr     = RC_NET_PHY_ADDR,
                                .phyOps      = &phyksz8081_ops,
                                .phyResource = &s_phyResource};
@@ -454,7 +464,9 @@ void RC_NET_Init(void)
      * looks exactly like "link never comes up".
      */
     const gpio_pin_config_t rstConfig = {kGPIO_DigitalOutput, 1, kGPIO_NoIntmode};
+    const gpio_pin_config_t intConfig = {kGPIO_DigitalInput, 0, kGPIO_NoIntmode};
     GPIO_PinInit(BOARD_ENET_PHY_RESET_GPIO, BOARD_ENET_PHY_RESET_GPIO_PIN, &rstConfig);
+    GPIO_PinInit(GPIO1, 10U, &intConfig); /* keep NAND_TREE# an input, pulled high */
     BOARD_ENET_PHY_RESET;
 
     (void)CLOCK_EnableClock(kCLOCK_Enet);
@@ -468,9 +480,38 @@ void RC_NET_Init(void)
     time_init();
     lwip_init();
 
-    (void)netif_add(&s_netif, NULL, NULL, NULL, &cfg, ethernetif0_init, ethernet_input);
+    /* read the PHY straight over MDIO before lwIP touches it: this separates "MDIO
+     * dead" from "PHY alive but never negotiates", which look identical from lwIP */
+    uint16_t id1 = 0U, id2 = 0U, bmcr = 0U, bmsr = 0U;
+    (void)mdio_read(RC_NET_PHY_ADDR, 2U, &id1);
+    (void)mdio_read(RC_NET_PHY_ADDR, 3U, &id2);
+    (void)mdio_read(RC_NET_PHY_ADDR, 0U, &bmcr);
+    (void)mdio_read(RC_NET_PHY_ADDR, 1U, &bmsr);
+    PRINTF("net: phy addr %d id %04x:%04x bmcr %04x bmsr %04x\r\n",
+           (int)RC_NET_PHY_ADDR, id1, id2, bmcr, bmsr);
+
+    if (netif_add(&s_netif, NULL, NULL, NULL, &cfg, ethernetif0_init, ethernet_input) == NULL)
+    {
+        PRINTF("net: netif_add FAILED - ethernetif0_init rejected the PHY\r\n");
+    }
     netif_set_default(&s_netif);
     netif_set_up(&s_netif);
+
+    /*
+     * Give autonegotiation the same blocking window the SDK examples use. Nothing is
+     * streaming yet at this point, so a few seconds here costs nothing, and it settles
+     * whether the link needs servicing more aggressively than a 500 ms poll provides.
+     */
+    for (uint32_t tries = 0U; tries < 3U; tries++)
+    {
+        if (ethernetif_wait_linkup(&s_netif, 4000) == ERR_OK)
+        {
+            PRINTF("net: link up after %u s\r\n", (unsigned)((tries * 4U) + 1U));
+            break;
+        }
+        PRINTF("net: autonegotiation still pending...\r\n");
+    }
+
     (void)dhcp_start(&s_netif);
 
     struct tcp_pcb *listen = tcp_new();
@@ -537,8 +578,18 @@ void RC_NET_Task(void)
     {
         struct dhcp *d = netif_dhcp_data(&s_netif);
         s_lastReport   = now;
-        PRINTF("net: waiting - link %s, dhcp state %d\r\n",
-               netif_is_link_up(&s_netif) ? "UP" : "DOWN", (d != NULL) ? (int)d->state : -1);
+
+        /* kick autonegotiation again: BMCR bit 12 = AN enable, bit 9 = AN restart */
+        if (!netif_is_link_up(&s_netif))
+        {
+            (void)mdio_write(RC_NET_PHY_ADDR, 0U, 0x1200U);
+        }
+        uint16_t bmsr = 0U, ctl1 = 0U;
+        (void)mdio_read(RC_NET_PHY_ADDR, 1U, &bmsr);
+        (void)mdio_read(RC_NET_PHY_ADDR, 0x1EU, &ctl1); /* KSZ8081 PHY Control 1 */
+        PRINTF("net: waiting - link %s, dhcp %d, bmsr %04x (link=%d anegDone=%d), ctl1 %04x\r\n",
+               netif_is_link_up(&s_netif) ? "UP" : "DOWN", (d != NULL) ? (int)d->state : -1,
+               bmsr, (bmsr >> 2) & 1U, (bmsr >> 5) & 1U, ctl1);
     }
 
     if (!ip4_addr_isany_val(*netif_ip4_addr(&s_netif)))
