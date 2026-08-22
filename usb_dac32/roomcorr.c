@@ -16,9 +16,11 @@
 
 #include <string.h>
 #include "fsl_debug_console.h"
+#include "fsl_gpt.h"
 #include "roomcorr.h"
 #include "roomcorr_eq.h"
 #include "roomcorr_filter.h"
+#include "roomcorr_stream.h"
 
 extern const float32_t rc_filter[RC_CHANNELS * RC_PARTITIONS * RC_FFT_SIZE];
 
@@ -34,24 +36,23 @@ extern const float32_t rc_filter[RC_CHANNELS * RC_PARTITIONS * RC_FFT_SIZE];
 #endif
 
 /*
- * Load measurement clock.
+ * Load measurement clock: GPT2, free running from the 24 MHz crystal.
  *
- * Not DWT CYCCNT: that counter lives in the debug power domain, and the RT1050 powers
- * that domain down once the probe detaches, so it silently freezes a second or two
- * after reset and every block then measures as 0 cycles. SysTick is core-local and
- * always clocked. It counts DOWN from LOAD, 24 bits at the 600 MHz core clock, so it
- * wraps every 27.9 ms -- longer than one 21.3 ms block, which is all we measure.
+ * Not DWT CYCCNT -- that lives in the debug power domain, which the RT1050 powers down
+ * when the probe detaches, so it freezes and every block then measures zero. Not SysTick
+ * either, any more: lwIP's bare-metal port takes SysTick for its 1 ms tick. GPT2 is
+ * free, counts up through a full 32 bits (179 s before wrap) and is independent of both.
  */
-#define RC_TICK_MASK (0x00FFFFFFU)
+#define RC_TICKS_PER_US (24U)
 
 static inline uint32_t rc_now(void)
 {
-    return SysTick->VAL;
+    return GPT_GetCurrentTimerCount(GPT2);
 }
 
 static inline uint32_t rc_elapsed(uint32_t t0)
 {
-    return (t0 - rc_now()) & RC_TICK_MASK;
+    return rc_now() - t0; /* unsigned wrap is exactly what we want */
 }
 
 /* int32 full scale <-> float. The USB/I2S samples are 32-bit signed. */
@@ -67,8 +68,9 @@ static float32_t *s_fdl;
 /* newest partition index; the line is walked forwards from here */
 static uint32_t s_head;
 
-/* previous input block per channel (the overlap half) */
-static float32_t s_prev[RC_CHANNELS][RC_BLOCK];
+/* previous input block per channel (the overlap half), in SDRAM: 8 KB, and it
+ * is walked linearly once per block so the cache covers it */
+static float32_t *s_prev[RC_CHANNELS];
 
 /* scratch: on-chip, touched twice per block per channel */
 static float32_t s_time[RC_FFT_SIZE];
@@ -132,7 +134,14 @@ void RC_Init(void)
     (void)arm_rfft_fast_init_f32(&s_fft, RC_FFT_SIZE);
 
     memset(s_fdl, 0, RC_FDL_FLOATS * sizeof(float32_t));
-    memset(s_prev, 0, sizeof(s_prev));
+    for (uint32_t ch = 0U; ch < RC_CHANNELS; ch++)
+    {
+        if (s_prev[ch] == NULL)
+        {
+            s_prev[ch] = (float32_t *)RCS_SdramAlloc(RC_BLOCK * sizeof(float32_t));
+        }
+        memset(s_prev[ch], 0, RC_BLOCK * sizeof(float32_t));
+    }
     s_head       = 0U;
     s_mix        = 1.0f;
     s_mixTarget  = 1.0f;
@@ -141,10 +150,15 @@ void RC_Init(void)
     s_clipCount  = 0U;
     s_blockCount = 0U;
 
-    /* free-running SysTick, see rc_now() */
-    SysTick->LOAD = RC_TICK_MASK;
-    SysTick->VAL  = 0U;
-    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_ENABLE_Msk;
+    /* free-running GPT2, see rc_now() */
+    gpt_config_t gpt;
+    GPT_GetDefaultConfig(&gpt);
+    gpt.clockSource   = kGPT_ClockSource_Osc; /* 24 MHz crystal, independent of the PLLs */
+    gpt.divider       = 1U;
+    gpt.enableFreeRun = true;
+    GPT_Init(GPT2, &gpt);
+    GPT_SetOscClockDivider(GPT2, 1U);
+    GPT_StartTimer(GPT2);
 }
 
 void RC_ProcessBlock(const int32_t *in, int32_t *out)
@@ -228,6 +242,7 @@ void RC_ProcessBlock(const int32_t *in, int32_t *out)
 }
 
 uint32_t RC_LastCycles(void)  { return s_lastCycles; }
+uint32_t RC_PeakMicros(void)  { return s_peakCycles / RC_TICKS_PER_US; }
 uint32_t RC_PeakCycles(void)  { return s_peakCycles; }
 uint32_t RC_ClipCount(void)   { return s_clipCount; }
 uint32_t RC_BlockCount(void)  { return s_blockCount; }
@@ -237,9 +252,10 @@ bool RC_GetBypass(void)        { return (s_mixTarget < 0.5f); }
 
 void RC_SelfTest(void)
 {
-    static int32_t tin[RC_BLOCK * RC_CHANNELS];
-    static int32_t tout[RC_BLOCK * RC_CHANNELS];
-    const int32_t  one = 1073741824; /* +0.5 full scale, keeps headroom */
+    /* 8 KB each, used once at boot: SDRAM, not DTCM */
+    int32_t *tin  = (int32_t *)RCS_SdramAlloc(RC_BLOCK * RC_CHANNELS * sizeof(int32_t));
+    int32_t *tout = (int32_t *)RCS_SdramAlloc(RC_BLOCK * RC_CHANNELS * sizeof(int32_t));
+    const int32_t one = 1073741824; /* +0.5 full scale, keeps headroom */
 
     PRINTF("\r\n--- room correction self test ---\r\n");
     PRINTF("taps %d, B %d, N %d, P %d, filter %d KiB, FDL %d KiB @ 0x%08x\r\n",
@@ -248,7 +264,7 @@ void RC_SelfTest(void)
              (unsigned)RC_SDRAM_BASE);
 
     /* impulse in, so the output is the filter's own impulse response */
-    memset(tin, 0, sizeof(tin));
+    memset(tin, 0, RC_BLOCK * RC_CHANNELS * sizeof(int32_t));
     tin[0] = one;                    /* left channel, first frame */
     tin[1] = one;                    /* right channel */
 
@@ -267,7 +283,7 @@ void RC_SelfTest(void)
     uint32_t peakIdx = 0U;
     for (uint32_t blk = 1U; blk < 8U; blk++)
     {
-        memset(tin, 0, sizeof(tin));
+        memset(tin, 0, RC_BLOCK * RC_CHANNELS * sizeof(int32_t));
         RC_ProcessBlock(tin, tout);
         for (uint32_t i = 0U; i < RC_BLOCK; i++)
         {
@@ -289,9 +305,8 @@ void RC_SelfTest(void)
            (int)((peakIdx * 1000U) / RC_SAMPLE_RATE));
     PRINTF("input impulse raw: %d, ifft compensation x%d\r\n",
            (int)one, (int)RC_IFFT_COMPENSATION);
-    PRINTF("block cost: %d cycles (%d us @600MHz), budget %d us\r\n",
-             (int)RC_PeakCycles(), (int)(RC_PeakCycles() / 600U),
-             (int)((RC_BLOCK * 1000000U) / RC_SAMPLE_RATE));
+    PRINTF("block cost: %d us, budget %d us\r\n", (int)RC_PeakMicros(),
+           (int)((RC_BLOCK * 1000000U) / RC_SAMPLE_RATE));
     PRINTF("--- end self test ---\r\n\r\n");
 
     RC_Init();

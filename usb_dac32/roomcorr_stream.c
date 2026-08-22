@@ -39,6 +39,7 @@ static int32_t   *s_blkIn;
 static int32_t   *s_blkOut;
 
 static volatile uint32_t s_underruns;
+static uint8_t *s_sdramCursor;
 
 /* ------------------------------------------------------------------ fifo ---- */
 
@@ -110,6 +111,7 @@ void RCS_Init(void)
     /* the filter store takes the rest of what we need: upload staging, decode scratch
      * and the two swappable partition slots */
     RC_FILTER_Init(p, (void **)&p);
+    s_sdramCursor = p;
 
     s_in.head = s_in.tail = 0U;
     s_out.head = s_out.tail = 0U;
@@ -124,6 +126,13 @@ void RCS_Init(void)
     PRINTF("room correction: SDRAM 0x%08x..0x%08x (%d KiB)\r\n",
              (unsigned)RC_SDRAM_BASE, (unsigned)(uintptr_t)p,
              (int)(((uintptr_t)p - RC_SDRAM_BASE) / 1024U));
+}
+
+void *RCS_SdramAlloc(uint32_t bytes)
+{
+    uint8_t *r = s_sdramCursor;
+    s_sdramCursor += (bytes + 31U) & ~31U;
+    return r;
 }
 
 void RCS_PushInput(const void *src, uint32_t bytes)
@@ -175,11 +184,11 @@ uint32_t RCS_OutputFill(void)
 void RCS_PrintStats(void)
 {
     const uint32_t budget = (RC_BLOCK * 1000000U) / RC_SAMPLE_RATE; /* us per block */
-    const uint32_t us     = RC_PeakCycles() / 600U;
+    const uint32_t us     = RC_PeakMicros();
 
-    PRINTF("rc: blocks %d, peak %d cyc (%d us of %d us = %d%% CPU), "
+    PRINTF("rc: blocks %d, peak %d us of %d us = %d%% CPU, "
              "out fill %d fr, underruns %d, clips %d, %s\r\n",
-             (int)RC_BlockCount(), (int)RC_PeakCycles(), (int)us, (int)budget,
+             (int)RC_BlockCount(), (int)us, (int)budget,
              (int)((us * 100U) / budget), (int)RCS_OutputFill(),
              (int)RCS_Underruns(), (int)RC_ClipCount(),
              RC_GetBypass() ? "BYPASS" : "active");

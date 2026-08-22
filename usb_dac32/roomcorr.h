@@ -39,6 +39,8 @@ void RC_ProcessBlock(const int32_t *in, int32_t *out);
 uint32_t RC_LastCycles(void);
 /*! Peak cycles seen so far. */
 uint32_t RC_PeakCycles(void);
+/*! Peak block cost in microseconds. */
+uint32_t RC_PeakMicros(void);
 /*! Samples clamped at the output since boot. */
 uint32_t RC_ClipCount(void);
 /*! Blocks processed since boot. */

@@ -32,6 +32,7 @@
 #include "usb_phy.h"
 #include "roomcorr.h"
 #include "roomcorr_stream.h"
+#include "roomcorr_net.h"
 #include "roomcorr_ui.h"
 #endif
 #if defined(USB_DEVICE_AUDIO_USE_SYNC_MODE) && (USB_DEVICE_AUDIO_USE_SYNC_MODE > 0U)
@@ -1837,6 +1838,8 @@ void main(void)
 
     RC_SelfTest();
 
+    RC_NET_Init();
+
     APPInit();
 
     uint32_t rcStatsAt = 0U;
@@ -1849,6 +1852,8 @@ void main(void)
         RCS_Task();
 
         RC_UI_Task();
+
+        RC_NET_Task();
 
         USB_AudioCodecTask();
 

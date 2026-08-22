@@ -19,6 +19,14 @@
 /*! Allocate the FIFOs in SDRAM and start the convolver. Call once SDRAM is up. */
 void RCS_Init(void);
 
+/*!
+ * @brief Carve a block out of SDRAM, 32-byte aligned.
+ *
+ * Everything that is large but not latency critical lives here rather than in the
+ * 128 KB DTCM, which lwIP and the USB stack have already largely spoken for.
+ */
+void *RCS_SdramAlloc(uint32_t bytes);
+
 /*! ISR: hand over the bytes just consumed from the USB play buffer. */
 void RCS_PushInput(const void *src, uint32_t bytes);
 /*! ISR: push `bytes` of silence (used while the host is not streaming). */
